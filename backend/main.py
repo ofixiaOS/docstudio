@@ -28,7 +28,9 @@ from app.models import (
     GenerateRequest,
     LibraryAttachRequest,
     MemoryWriteRequest,
+    QuickCreateRequest,
     RefineRequest,
+    SectionUpdateRequest,
     SnapshotRequest,
 )
 from app.settings import get_gemini_api_key, persist_env_value, settings
@@ -112,12 +114,15 @@ async def hybrid_memory_search(project_id: str, query: str, limit: int = 8) -> l
             vector = store.search_memories_vector(project_id, query_embedding, limit)
         except Exception:
             vector = []
-    combined = {item["id"]: item for item in [*vector, *lexical]}
-    return sorted(
-        combined.values(),
-        key=lambda item: (float(item.get("similarity", 0)), float(item.get("importance", 0))),
-        reverse=True,
-    )[:limit]
+    scores: dict[str, float] = {}
+    values: dict[str, dict] = {}
+    for result_set, weight in ((lexical, 1.0), (vector, 1.25)):
+        for rank, item in enumerate(result_set, start=1):
+            values[item["id"]] = item
+            importance_boost = float(item.get("importance", 0.5)) * 0.15
+            scores[item["id"]] = scores.get(item["id"], 0) + (weight / (40 + rank)) + importance_boost
+    ordered = sorted(values.values(), key=lambda item: scores[item["id"]], reverse=True)
+    return ordered[:limit]
 
 
 @app.get("/api/health")
@@ -182,6 +187,111 @@ def create_snapshot(project_id: str, request: SnapshotRequest) -> dict:
     require_project(project_id)
     version = store.create_snapshot(project_id, request.html_content, request.reason)
     return {"status": "saved", "version": version}
+
+
+@app.get("/api/projects/{project_id}/versions")
+def list_versions(project_id: str) -> list[dict]:
+    require_project(project_id)
+    return store.list_versions(project_id)
+
+
+@app.post("/api/projects/{project_id}/versions/{version_number}/restore")
+def restore_version(project_id: str, version_number: int) -> dict:
+    require_project(project_id)
+    try:
+        return store.restore_version(project_id, version_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def update_html_section(existing_html: str, heading: str, content_html: str) -> str:
+    soup = BeautifulSoup(existing_html or "", "html.parser")
+    clean_heading = heading.strip().lower()
+    target = None
+    for h in soup.find_all(["h1", "h2", "h3"]):
+        ht = h.get_text(" ", strip=True).lower()
+        if clean_heading in ht or ht in clean_heading:
+            target = h
+            break
+    new_section_soup = BeautifulSoup(content_html, "html.parser")
+    if target:
+        curr = target.next_sibling
+        while curr:
+            if isinstance(curr, Tag) and curr.name.lower() in ["h1", "h2", "h3"]:
+                break
+            nxt = curr.next_sibling
+            curr.extract()
+            curr = nxt
+        insert_pt = target
+        for el in list(new_section_soup.children):
+            insert_pt.insert_after(el)
+            insert_pt = el
+        return str(soup)
+    else:
+        h_tag = soup.new_tag("h2")
+        h_tag.string = heading
+        soup.append(h_tag)
+        for el in list(new_section_soup.children):
+            soup.append(el)
+        return str(soup)
+
+
+@app.post("/api/projects/quick-create")
+def quick_create_project(request: QuickCreateRequest) -> dict:
+    outline = [item.model_dump() for item in request.initial_sections] if request.initial_sections else [
+        {"id": "sec-intro", "title": "Introducción", "description": "Contexto y objetivos", "type": "intro", "needs_code": False, "needs_evidence": False},
+        {"id": "sec-dev", "title": "Desarrollo Técnico", "description": "Ejecución y evidencia", "type": "development", "needs_code": True, "needs_evidence": True},
+        {"id": "sec-conc", "title": "Conclusión", "description": "Síntesis de aprendizajes", "type": "conclusion", "needs_code": False, "needs_evidence": False},
+        {"id": "sec-bib", "title": "Bibliografía", "description": "Fuentes consultadas", "type": "references", "needs_code": False, "needs_evidence": False},
+    ]
+    project_id = store.create_project(
+        title=request.title,
+        subject=request.subject,
+        student=request.student,
+        career=request.career,
+        summary=request.summary or f"Trabajo para {request.subject}",
+        rubric_text=request.pauta_text,
+        deliverables=request.deliverables,
+        outline=outline,
+    )
+    criteria = []
+    if request.criteria:
+        criteria = store.add_criteria(project_id, [item.model_dump() for item in request.criteria])
+    if request.pauta_text:
+        source_dir = settings.projects_dir / project_id / "sources"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        source_file = source_dir / "pauta.txt"
+        source_file.write_text(request.pauta_text, encoding="utf-8")
+        store.add_source(project_id, source_file, "pauta.txt", "rubric", request.pauta_text)
+    return {
+        "status": "created",
+        "project_id": project_id,
+        "title": request.title,
+        "subject": request.subject,
+        "criteria": criteria,
+        "outline": outline,
+    }
+
+
+@app.patch("/api/projects/{project_id}/section")
+def update_project_section(project_id: str, request: SectionUpdateRequest) -> dict:
+    project = require_project(project_id)
+    current_html = project.get("document_html") or ""
+    new_html = update_html_section(current_html, request.heading, request.content_html)
+    version = None
+    if request.create_snapshot:
+        version = store.create_snapshot(project_id, new_html, request.reason or f"section:{request.heading[:25]}")
+    else:
+        store.update_document(project_id, new_html)
+    return {
+        "status": "updated",
+        "project_id": project_id,
+        "heading": request.heading,
+        "version": version,
+        "html_content": new_html,
+    }
+
+
 
 
 @app.post("/api/analyze-rubric")
@@ -294,7 +404,7 @@ def search_project_sources(project_id: str, q: str, limit: int = 8) -> dict:
     return {"results": store.search_sources(project_id, q, max(1, min(limit, 20)))}
 
 
-def section_prompt(request: GenerateRequest, card: dict, rubric_context: str, source_context: str) -> str:
+def section_prompt(request: GenerateRequest, card: dict, rubric_context: str, source_context: str, memory_context: str = "") -> str:
     return f"""
 Redacta solamente una sección de un trabajo académico técnico para Iplacex.
 
@@ -308,10 +418,13 @@ REQUIERE CAPTURA/EVIDENCIA: {card.get('needs_evidence', False)}
 CRITERIOS RELACIONADOS:
 {rubric_context or 'No hay criterios específicos asociados.'}
 
+PREFERENCIAS O DECISIONES RECORDADAS DEL PROYECTO:
+{memory_context or 'Ninguna preferencia previa registrada.'}
+
 FRAGMENTOS DE FUENTES DISPONIBLES:
 {source_context or 'No se adjuntaron materiales adicionales. No inventes citas ni resultados de ejecución.'}
 
-Devuelve HTML semántico compatible con Tiptap. Comienza con h1 o h2 según corresponda y usa p, ul, ol,
+Devuelve HTML semántico compatible con Tiptap. Comienza con h2 según corresponda y usa p, ul, ol,
 pre/code y blockquote. Si hace falta una captura real, inserta exactamente un blockquote que comience con
 "EVIDENCIA PENDIENTE:" y describa qué debe demostrar la captura; jamás inventes que una ejecución ocurrió.
 No inventes bibliografía. Cuando uses una fuente adjunta, cítala por su nombre de archivo en el texto.
@@ -341,8 +454,12 @@ async def generate_document(request: GenerateRequest) -> dict:
             source_context = "\n\n".join(
                 f"[Fuente: {hit['filename']}, fragmento {hit['chunk_index'] + 1}]\n{hit['content']}" for hit in source_hits
             )[:14000]
+            memory_hits = await hybrid_memory_search(
+                request.project_id, f"{card['title']} {card['description']}", 4
+            ) if request.project_id else []
+            memory_context = "\n".join(f"- {item['content']}" for item in memory_hits)
             sections.append(clean_model_output(await run_in_threadpool(
-                ai.text, section_prompt(request, card, rubric_context, source_context)
+                ai.text, section_prompt(request, card, rubric_context, source_context, memory_context)
             )))
     html_content = "\n".join(sections)
     if request.project_id:
@@ -395,6 +512,20 @@ async def remember(project_id: str, request: MemoryWriteRequest) -> dict:
             embedding = None
     return store.add_memory(project_id, request.kind, request.content, request.importance,
                             embedding=embedding, embedding_model=settings.embedding_model if embedding else None)
+
+
+@app.get("/api/projects/{project_id}/memories")
+def list_project_memories(project_id: str) -> list[dict]:
+    require_project(project_id)
+    return store.list_memories(project_id)
+
+
+@app.delete("/api/memories/{memory_id}")
+def delete_memory(memory_id: str) -> dict:
+    deleted = store.delete_memory(memory_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Memoria no encontrada.")
+    return {"status": "deleted", "id": memory_id}
 
 
 @app.post("/api/projects/{project_id}/chat", response_model=ChatResult)
@@ -533,30 +664,82 @@ def evidence_content(evidence_id: str) -> FileResponse:
 def parse_html_to_sections(html_content: str) -> list[dict]:
     soup = BeautifulSoup(html_content or "", "html.parser")
     sections: list[dict] = []
-    for node in soup.children:
-        if isinstance(node, NavigableString) or not isinstance(node, Tag):
-            continue
+    root = soup.body or soup
+    mapping = {"h1": "h1", "h2": "h2", "h3": "h3", "pre": "code", "blockquote": "callout", "p": "paragraph"}
+
+    def process_node(node: Tag) -> None:
         tag = node.name.lower()
         if tag in {"ul", "ol"}:
             section_type = "ordered_item" if tag == "ol" else "list_item"
             for li in node.find_all("li", recursive=False):
-                sections.append({"type": section_type, "content": li.get_text(" ", strip=True), "content_html": str(li)})
-            continue
+                sections.append({
+                    "type": section_type,
+                    "content": li.get_text(" ", strip=True),
+                    "content_html": str(li),
+                })
+            return
+
         if tag == "img":
-            sections.append({"type": "image", "content": "", "image_path": node.get("src"), "image_alt": node.get("alt")})
-            continue
-        mapping = {"h1": "h1", "h2": "h2", "h3": "h3", "pre": "code", "blockquote": "callout", "p": "paragraph"}
+            sections.append({
+                "type": "image",
+                "content": "",
+                "image_path": node.get("src"),
+                "image_alt": node.get("alt"),
+            })
+            return
+
+        # If a block contains img tags, separate them cleanly so images are never lost
+        if node.find("img"):
+            for child in list(node.children):
+                if isinstance(child, NavigableString):
+                    text = str(child).strip()
+                    if text:
+                        sections.append({
+                            "type": mapping.get(tag, "paragraph"),
+                            "content": text,
+                            "content_html": f"<{tag}>{html.escape(text)}</{tag}>",
+                        })
+                elif isinstance(child, Tag):
+                    if child.name.lower() == "img":
+                        sections.append({
+                            "type": "image",
+                            "content": "",
+                            "image_path": child.get("src"),
+                            "image_alt": child.get("alt"),
+                        })
+                    else:
+                        if child.find("img"):
+                            process_node(child)
+                        else:
+                            child_text = child.get_text(" ", strip=True)
+                            if child_text:
+                                sections.append({
+                                    "type": mapping.get(tag, "paragraph"),
+                                    "content": child_text,
+                                    "content_html": str(child),
+                                })
+            return
+
         if tag not in mapping:
-            for child in node.find_all(["h1", "h2", "h3", "p", "pre", "blockquote", "li", "img"], recursive=True):
-                child_type = "image" if child.name == "img" else mapping.get(child.name, "list_item")
-                sections.append({"type": child_type, "content": child.get_text(" ", strip=True),
-                                 "content_html": str(child),
-                                 "image_path": child.get("src") if child.name == "img" else None,
-                                 "image_alt": child.get("alt") if child.name == "img" else None})
-            continue
-        sections.append({"type": mapping[tag], "content": node.get_text("\n" if tag == "pre" else " ", strip=True),
-                         "content_html": str(node)})
+            for child in node.children:
+                if isinstance(child, Tag):
+                    process_node(child)
+            return
+
+        content = node.get_text("\n" if tag == "pre" else " ", strip=True)
+        if content:
+            sections.append({
+                "type": mapping[tag],
+                "content": content,
+                "content_html": str(node),
+            })
+
+    for top_child in root.children:
+        if isinstance(top_child, Tag):
+            process_node(top_child)
+
     return sections
+
 
 
 def resolve_image_path(value: str | None) -> str | None:

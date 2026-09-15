@@ -241,6 +241,34 @@ class Store:
             )
         return version
 
+    def list_versions(self, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT id, project_id, version_number, reason, length(html_content) AS size, created_at "
+                "FROM project_versions WHERE project_id=? ORDER BY version_number DESC",
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_version(self, project_id: str, version_number: int) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM project_versions WHERE project_id=? AND version_number=?",
+                (project_id, version_number),
+            ).fetchone()
+        return self._row(row)
+
+    def restore_version(self, project_id: str, version_number: int) -> dict[str, Any]:
+        target = self.get_version(project_id, version_number)
+        if not target:
+            raise ValueError(f"Versión {version_number} no encontrada.")
+        new_version = self.create_snapshot(project_id, target["html_content"], f"restored_from_v{version_number}")
+        return {
+            "version_number": new_version,
+            "restored_from": version_number,
+            "html_content": target["html_content"],
+        }
+
     def add_message(self, project_id: str, role: str, content: str) -> dict[str, Any]:
         item = {"id": new_id("msg"), "project_id": project_id, "role": role, "content": content, "created_at": utcnow()}
         with self.connect() as db:
@@ -261,16 +289,46 @@ class Store:
     def add_memory(self, project_id: str | None, kind: str, content: str,
                    importance: float = 0.6, source: str = "user",
                    embedding: list[float] | None = None, embedding_model: str | None = None) -> dict[str, Any]:
-        now = utcnow()
-        item = {"id": new_id("mem"), "project_id": project_id, "kind": kind, "content": content,
-                "importance": importance, "source": source, "created_at": now, "last_accessed_at": now}
+        clean_content = content.strip()
         with self.connect() as db:
+            existing = db.execute(
+                "SELECT * FROM memories WHERE (project_id=? OR (project_id IS NULL AND ? IS NULL)) AND lower(content)=?",
+                (project_id, project_id, clean_content.lower()),
+            ).fetchone()
+            if existing:
+                new_importance = max(float(existing["importance"]), importance)
+                db.execute(
+                    "UPDATE memories SET importance=?, last_accessed_at=? WHERE id=?",
+                    (new_importance, utcnow(), existing["id"]),
+                )
+                updated = dict(existing)
+                updated["importance"] = new_importance
+                return updated
+
+            now = utcnow()
+            item = {"id": new_id("mem"), "project_id": project_id, "kind": kind, "content": clean_content,
+                    "importance": importance, "source": source, "created_at": now, "last_accessed_at": now}
             db.execute(
                 "INSERT INTO memories(id,project_id,kind,content,importance,source,embedding_json,embedding_model,created_at,last_accessed_at) "
                 "VALUES(:id,:project_id,:kind,:content,:importance,:source,:embedding_json,:embedding_model,:created_at,:last_accessed_at)",
                 {**item, "embedding_json": json.dumps(embedding) if embedding else None, "embedding_model": embedding_model}
             )
         return item
+
+    def list_memories(self, project_id: str | None) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT id, project_id, kind, content, importance, source, created_at, last_accessed_at "
+                "FROM memories WHERE project_id=? OR project_id IS NULL ORDER BY importance DESC, last_accessed_at DESC",
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_memory(self, memory_id: str) -> bool:
+        with self.connect() as db:
+            cursor = db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+            return cursor.rowcount > 0
+
 
     def search_memories(self, project_id: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
         tokens = [token for token in re.findall(r"\w+", query.lower()) if len(token) > 3]

@@ -8,6 +8,7 @@ import {
   Bold, Italic, Heading1, Heading2, Heading3, List, ListOrdered, Quote, Code,
   FileDown, Printer, Wand2, Undo, Redo, Sparkles, Save, ImagePlus, BookOpenCheck,
   MessageSquareText, Paperclip, Send, CircleCheck, CircleDashed, TriangleAlert,
+  History, RotateCcw, X,
 } from 'lucide-react';
 
 const TABS = [
@@ -17,14 +18,15 @@ const TABS = [
 ];
 
 export default function EditorView({
-  docData, projectData, analysisData, messages, auditResult, savingState,
-  onDocumentChange, onSnapshot, onExportDocx, exporting, onRefineText, refining,
+  docData, projectData, analysisData, messages, versions = [], auditResult, savingState,
+  onDocumentChange, onSnapshot, onRestoreVersion, onExportDocx, exporting, onRefineText, refining,
   onChat, chatting, onAudit, auditing, onUploadEvidence, onUploadSources,
 }) {
   const [aiPrompt, setAiPrompt] = useState('');
   const [chatPrompt, setChatPrompt] = useState('');
   const [activeTab, setActiveTab] = useState('rubric');
   const [uploading, setUploading] = useState(false);
+  const [isVersionModalOpen, setIsVersionModalOpen] = useState(false);
   const evidenceInputRef = useRef(null);
   const sourceInputRef = useRef(null);
 
@@ -105,7 +107,8 @@ export default function EditorView({
             </span>
           </div>
           <div className="action-group">
-            <button className="btn-secondary" onClick={() => onSnapshot(editor.getHTML())}><Save size={15} /> Versión</button>
+            <button className="btn-secondary" onClick={() => onSnapshot(editor.getHTML())} title="Guardar snapshot"><Save size={15} /> Versión</button>
+            <button className="btn-secondary" onClick={() => setIsVersionModalOpen(true)} title="Historial de versiones"><History size={15} /> Historial ({versions.length})</button>
             <button className="btn-secondary" onClick={() => window.print()}><Printer size={15} /> PDF</button>
             <button className="btn-primary" onClick={() => onExportDocx(editor.getHTML())} disabled={exporting}>
               {exporting ? <div className="spinner" /> : <FileDown size={16} />} Word
@@ -224,6 +227,78 @@ export default function EditorView({
           </div>
         )}
       </aside>
+
+      {isVersionModalOpen && (
+        <div className="modal-backdrop" onClick={() => setIsVersionModalOpen(false)}>
+          <div className="modal-card" style={{ maxWidth: 580 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                <div style={{ background: 'rgba(59, 130, 246, 0.15)', padding: '0.5rem', borderRadius: '10px', color: 'var(--accent)' }}>
+                  <History size={20} />
+                </div>
+                <div>
+                  <h3 style={{ fontSize: '1.15rem', fontWeight: 700 }}>Historial de Versiones</h3>
+                  <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                    Restaura cualquier punto de guardado previo del documento.
+                  </p>
+                </div>
+              </div>
+              <button onClick={() => setIsVersionModalOpen(false)} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', cursor: 'pointer' }}>
+                <X size={20} />
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '380px', overflowY: 'auto', marginBottom: '1.25rem' }}>
+              {versions.length === 0 ? (
+                <p style={{ textAlign: 'center', color: 'var(--text-dim)', padding: '2rem 0', fontSize: '0.9rem' }}>
+                  No hay versiones guardadas todavía. Haz clic en "Versión" para crear la primera.
+                </p>
+              ) : (
+                versions.map((v) => (
+                  <div key={v.id || v.version_number} style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    padding: '10px 14px', border: '1px solid var(--border)', borderRadius: '10px',
+                    background: 'var(--bg-input)'
+                  }}>
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '3px' }}>
+                        <strong style={{ color: 'var(--text-main)', fontSize: '0.95rem' }}>Versión {v.version_number}</strong>
+                        <span className="brand-badge" style={{ fontSize: '10px', textTransform: 'uppercase' }}>{v.reason}</span>
+                      </div>
+                      <span style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                        {new Date(v.created_at).toLocaleString('es-CL')} · {(v.size / 1024).toFixed(1)} KB
+                      </span>
+                    </div>
+
+                    <button
+                      className="btn-primary compact"
+                      onClick={async () => {
+                        if (window.confirm(`¿Seguro que deseas restaurar la Versión ${v.version_number}? Se creará un nuevo snapshot con tu contenido actual antes de restaurar.`)) {
+                          const restored = await onRestoreVersion(v.version_number);
+                          if (restored) {
+                            editor.commands.setContent(restored);
+                            setIsVersionModalOpen(false);
+                          }
+                        }
+                      }}
+                      title="Restaurar este contenido en el editor"
+                    >
+                      <RotateCcw size={13} /> Restaurar
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button className="btn-secondary" onClick={() => setIsVersionModalOpen(false)}>
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+

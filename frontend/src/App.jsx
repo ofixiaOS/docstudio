@@ -41,6 +41,7 @@ export default function App() {
     subject: '',
   });
   const [docData, setDocData] = useState(null);
+  const [versions, setVersions] = useState([]);
   const [auditResult, setAuditResult] = useState(null);
   const [isKeyModalOpen, setIsKeyModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -56,6 +57,19 @@ export default function App() {
   const loadProjects = useCallback(async () => {
     const data = await api('/api/projects');
     setProjects(data);
+  }, []);
+
+  const loadVersions = useCallback(async (projectId) => {
+    if (!projectId) {
+      setVersions([]);
+      return;
+    }
+    try {
+      const data = await api(`/api/projects/${projectId}/versions`);
+      setVersions(data);
+    } catch {
+      setVersions([]);
+    }
   }, []);
 
   const bootstrap = useCallback(async () => {
@@ -83,13 +97,15 @@ export default function App() {
   const openProject = async (projectId) => {
     setErrorMessage('');
     try {
-      const [project, history] = await Promise.all([
+      const [project, history, versionList] = await Promise.all([
         api(`/api/projects/${projectId}`),
         api(`/api/projects/${projectId}/messages`),
+        api(`/api/projects/${projectId}/versions`).catch(() => []),
       ]);
       setActiveProjectId(projectId);
       setProjectData(project);
       setMessages(history);
+      setVersions(versionList || []);
       setUploadParams({ student: project.student, career: project.career, subject: project.subject });
       setAnalysisData({
         project_id: project.id,
@@ -118,6 +134,7 @@ export default function App() {
     setActiveProjectId(null);
     setProjectData(null);
     setMessages([]);
+    setVersions([]);
     setAuditResult(null);
     setAnalysisData(EMPTY_ANALYSIS);
     setDocData(null);
@@ -202,6 +219,22 @@ export default function App() {
       body: JSON.stringify({ html_content: htmlContent, reason: 'manual' }),
     });
     setSavingState(`v${result.version}`);
+    await loadVersions(activeProjectId);
+  };
+
+  const handleRestoreVersion = async (versionNumber) => {
+    try {
+      const result = await api(`/api/projects/${activeProjectId}/versions/${versionNumber}/restore`, {
+        method: 'POST',
+      });
+      setDocData((current) => ({ ...current, html_content: result.html_content }));
+      setSavingState(`v${result.version_number}`);
+      await loadVersions(activeProjectId);
+      return result.html_content;
+    } catch (error) {
+      setErrorMessage(error.message);
+      return null;
+    }
   };
 
   const handleRefineText = async (selectedText, instruction) => {
@@ -322,8 +355,9 @@ export default function App() {
               onGenerate={handleGenerate} onBack={() => setStep('upload')} generating={generating} />}
             {step === 'editor' && (
               <EditorView docData={docData} projectData={projectData} analysisData={analysisData}
-                messages={messages} auditResult={auditResult} savingState={savingState}
+                messages={messages} versions={versions} auditResult={auditResult} savingState={savingState}
                 onDocumentChange={handleDocumentChange} onSnapshot={handleSnapshot}
+                onRestoreVersion={handleRestoreVersion}
                 onExportDocx={handleExportDocx} exporting={exporting}
                 onRefineText={handleRefineText} refining={refining}
                 onChat={handleChat} chatting={chatting} onAudit={handleAudit} auditing={auditing}

@@ -66,6 +66,26 @@ class SnapshotRequest(BaseModel):
     reason: str = "manual"
 
 
+class QuickCreateRequest(BaseModel):
+    title: str
+    subject: str = "General"
+    student: str = "Nicolás Javier Jara Guzmán"
+    career: str = "Ingeniería en Informática"
+    summary: str = ""
+    pauta_text: str = ""
+    deliverables: list[str] = Field(default_factory=list)
+    criteria: list[RubricCriterionDraft] = Field(default_factory=list)
+    initial_sections: list[OutlineCard] = Field(default_factory=list)
+
+
+class SectionUpdateRequest(BaseModel):
+    heading: str
+    content_html: str
+    create_snapshot: bool = True
+    reason: str = "section_update"
+
+
+
 class MemoryWriteRequest(BaseModel):
     content: str = Field(min_length=3, max_length=5000)
     kind: Literal["preference", "fact", "decision", "summary"] = "fact"
