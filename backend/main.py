@@ -8,37 +8,61 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from bs4 import BeautifulSoup, NavigableString, Tag
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.ai import ai
+from app.audit_service import (
+    audit_score,
+    enforce_evidence_grounding,
+    offline_audit,
+    valid_evidence_by_criterion,
+)
 from app.documents import classify_document, extract_text, list_library_files
+from app.evidence import apply_watermark
+from app.html_utils import (
+    clean_model_output,
+    parse_html_to_sections,
+    resolve_image_path as _resolve_image_path,
+    update_html_section,
+)
 from app.models import (
     AuditItem,
     AuditRequest,
     AuditResult,
+    AgentExecutionRequest,
     ChatRequest,
     ChatResult,
     ConfigUpdateRequest,
+    CriteriaUpdateRequest,
     DocumentSaveRequest,
     ExportDocxRequest,
     GenerateRequest,
     LibraryAttachRequest,
     MemoryWriteRequest,
+    OutlineUpdateRequest,
+    PackageSubmissionRequest,
     QuickCreateRequest,
     RefineRequest,
+    RegenerateSectionRequest,
+    RestoreVersionRequest,
     SectionUpdateRequest,
     SnapshotRequest,
 )
+from app.packaging import package_project_submission
+from app.prompts import default_outline, section_prompt
+from app.search import index_source_embeddings as _search_index_source_embeddings
+from app.search import hybrid_memory_search as _search_hybrid_memory
+from app.search import hybrid_source_search as _search_hybrid_source
 from app.settings import get_gemini_api_key, persist_env_value, settings
 from app.storage import Store
-from docx_exporter import create_iplacex_document
+from app.uploads import save_content_addressed_upload, save_upload
+from docx_exporter import create_docx_document
 
 
-app = FastAPI(title="Gamma Iplacex API", version="2.0.0")
+app = FastAPI(title="DocStudio API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -48,6 +72,15 @@ app.add_middleware(
 )
 store = Store(settings.database_path)
 
+AGENT_ARTIFACT_KINDS = {
+    "document", "code", "database", "archive", "model", "image", "report", "data", "other",
+}
+AGENT_ARTIFACT_EXTENSIONS = {
+    ".docx", ".pdf", ".txt", ".md", ".csv", ".xlsx", ".sql", ".db", ".sqlite", ".dmd",
+    ".py", ".java", ".cs", ".csproj", ".sln", ".html", ".css", ".js", ".jsx", ".ts", ".tsx",
+    ".json", ".xml", ".yaml", ".yml", ".zip", ".rar", ".7z", ".png", ".jpg", ".jpeg", ".webp",
+}
+
 
 def require_project(project_id: str) -> dict:
     project = store.get_project(project_id)
@@ -56,73 +89,25 @@ def require_project(project_id: str) -> dict:
     return project
 
 
-def clean_model_output(value: str) -> str:
-    value = value.strip()
-    value = re.sub(r"^```(?:html|json)?\s*", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s*```$", "", value)
-    return value.strip()
+def require_project_criterion(project: dict, criterion_id: str | None) -> str | None:
+    criterion_id = (criterion_id or "").strip() or None
+    if criterion_id and not any(item["id"] == criterion_id for item in project.get("criteria", [])):
+        raise HTTPException(status_code=400, detail="El criterio no pertenece al proyecto.")
+    return criterion_id
 
-
-def save_upload(upload: UploadFile, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    upload.file.seek(0)
-    with destination.open("wb") as output:
-        shutil.copyfileobj(upload.file, output)
-
+# -- Thin wrappers that bind the module-level store to the extracted service functions --
 
 def index_source_embeddings(source_id: str) -> int:
-    if not get_gemini_api_key():
-        return 0
-    chunks = store.get_source_chunks(source_id)
-    pending = [item for item in chunks if not item.get("embedding_json")]
-    if not pending:
-        return 0
-    vectors = ai.embed_documents(
-        [item["content"] for item in pending],
-        [item["filename"] for item in pending],
-    )
-    pairs = [(item["id"], vector) for item, vector in zip(pending, vectors) if vector]
-    store.set_chunk_embeddings(pairs, settings.embedding_model)
-    return len(pairs)
+    return _search_index_source_embeddings(source_id, store)
 
 
 async def hybrid_source_search(project_id: str, query: str, limit: int = 8) -> list[dict]:
-    lexical = store.search_sources(project_id, query, limit)
-    vector = []
-    if get_gemini_api_key():
-        try:
-            query_embedding = await run_in_threadpool(ai.embed_query, query)
-            vector = store.search_sources_vector(project_id, query_embedding, limit)
-        except Exception:
-            vector = []
-    scores: dict[str, float] = {}
-    values: dict[str, dict] = {}
-    for result_set, weight in ((lexical, 1.0), (vector, 1.25)):
-        for rank, item in enumerate(result_set, start=1):
-            values[item["id"]] = item
-            scores[item["id"]] = scores.get(item["id"], 0) + weight / (40 + rank)
-    ordered = sorted(values.values(), key=lambda item: scores[item["id"]], reverse=True)
-    return ordered[:limit]
+    return await _search_hybrid_source(project_id, query, limit, store)
 
 
 async def hybrid_memory_search(project_id: str, query: str, limit: int = 8) -> list[dict]:
-    lexical = store.search_memories(project_id, query, limit)
-    vector = []
-    if get_gemini_api_key():
-        try:
-            query_embedding = await run_in_threadpool(ai.embed_query, query)
-            vector = store.search_memories_vector(project_id, query_embedding, limit)
-        except Exception:
-            vector = []
-    scores: dict[str, float] = {}
-    values: dict[str, dict] = {}
-    for result_set, weight in ((lexical, 1.0), (vector, 1.25)):
-        for rank, item in enumerate(result_set, start=1):
-            values[item["id"]] = item
-            importance_boost = float(item.get("importance", 0.5)) * 0.15
-            scores[item["id"]] = scores.get(item["id"], 0) + (weight / (40 + rank)) + importance_boost
-    ordered = sorted(values.values(), key=lambda item: scores[item["id"]], reverse=True)
-    return ordered[:limit]
+    return await _search_hybrid_memory(project_id, query, limit, store)
+
 
 
 @app.get("/api/health")
@@ -142,9 +127,9 @@ def get_config() -> dict:
     return {
         "has_api_key": bool(key),
         "api_key_masked": f"{key[:4]}...{key[-4:]}" if len(key) > 8 else ("Configurada" if key else "No configurada"),
-        "default_student": "Nicolás Javier Jara Guzmán",
-        "default_institution": "Instituto Profesional Iplacex",
-        "default_career": "Ingeniería en Informática",
+        "default_student": settings.default_author,
+        "default_institution": settings.default_institution,
+        "default_career": settings.default_career,
         "model": settings.gemini_model,
         "embedding_model": settings.embedding_model,
         "library_root": str(settings.library_root),
@@ -154,9 +139,16 @@ def get_config() -> dict:
 
 @app.post("/api/config")
 def update_config(request: ConfigUpdateRequest) -> dict:
-    persist_env_value("GEMINI_API_KEY", request.gemini_api_key.strip())
+    if request.gemini_api_key:
+        persist_env_value("GEMINI_API_KEY", request.gemini_api_key.strip())
     if request.gemini_model:
         persist_env_value("GEMINI_MODEL", request.gemini_model.strip())
+    if request.author_name is not None:
+        persist_env_value("STUDIO_DEFAULT_AUTHOR", request.author_name.strip())
+    if request.institution is not None:
+        persist_env_value("STUDIO_DEFAULT_INSTITUTION", request.institution.strip())
+    if request.career is not None:
+        persist_env_value("STUDIO_DEFAULT_CAREER", request.career.strip())
     return {"status": "ok", "message": "Configuración guardada."}
 
 
@@ -175,11 +167,45 @@ def get_project(project_id: str) -> dict:
     return require_project(project_id)
 
 
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str) -> dict:
+    require_project(project_id)
+    deleted = store.delete_project(project_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
+    return {"status": "deleted", "id": project_id}
+
+
 @app.put("/api/projects/{project_id}/document")
 def save_document(project_id: str, request: DocumentSaveRequest) -> dict:
     require_project(project_id)
     store.update_document(project_id, request.html_content)
     return {"status": "saved"}
+
+
+@app.put("/api/projects/{project_id}/outline")
+def update_project_outline(project_id: str, request: OutlineUpdateRequest) -> dict:
+    require_project(project_id)
+    serialized = [item.model_dump() for item in request.outline]
+    store.update_outline(project_id, serialized)
+    return {"status": "saved", "project_id": project_id, "outline": serialized}
+
+
+@app.put("/api/projects/{project_id}/criteria")
+def replace_project_criteria(project_id: str, request: CriteriaUpdateRequest) -> dict:
+    require_project(project_id)
+    serialized = [item.model_dump() for item in request.criteria]
+    updated = store.replace_criteria(project_id, serialized)
+    return {"status": "saved", "project_id": project_id, "criteria": updated}
+
+
+@app.post("/api/projects/{project_id}/criteria")
+def add_project_criteria(project_id: str, request: CriteriaUpdateRequest) -> dict:
+    require_project(project_id)
+    serialized = [item.model_dump() for item in request.criteria]
+    added = store.add_criteria(project_id, serialized)
+    return {"status": "added", "project_id": project_id, "criteria": added}
+
 
 
 @app.post("/api/projects/{project_id}/snapshots")
@@ -196,54 +222,20 @@ def list_versions(project_id: str) -> list[dict]:
 
 
 @app.post("/api/projects/{project_id}/versions/{version_number}/restore")
-def restore_version(project_id: str, version_number: int) -> dict:
+def restore_version(project_id: str, version_number: int, request: RestoreVersionRequest | None = None) -> dict:
     require_project(project_id)
     try:
-        return store.restore_version(project_id, version_number)
+        current_html = request.current_html_content if request else None
+        return store.restore_version(project_id, version_number, current_html)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-def update_html_section(existing_html: str, heading: str, content_html: str) -> str:
-    soup = BeautifulSoup(existing_html or "", "html.parser")
-    clean_heading = heading.strip().lower()
-    target = None
-    for h in soup.find_all(["h1", "h2", "h3"]):
-        ht = h.get_text(" ", strip=True).lower()
-        if clean_heading in ht or ht in clean_heading:
-            target = h
-            break
-    new_section_soup = BeautifulSoup(content_html, "html.parser")
-    if target:
-        curr = target.next_sibling
-        while curr:
-            if isinstance(curr, Tag) and curr.name.lower() in ["h1", "h2", "h3"]:
-                break
-            nxt = curr.next_sibling
-            curr.extract()
-            curr = nxt
-        insert_pt = target
-        for el in list(new_section_soup.children):
-            insert_pt.insert_after(el)
-            insert_pt = el
-        return str(soup)
-    else:
-        h_tag = soup.new_tag("h2")
-        h_tag.string = heading
-        soup.append(h_tag)
-        for el in list(new_section_soup.children):
-            soup.append(el)
-        return str(soup)
 
 
 @app.post("/api/projects/quick-create")
 def quick_create_project(request: QuickCreateRequest) -> dict:
-    outline = [item.model_dump() for item in request.initial_sections] if request.initial_sections else [
-        {"id": "sec-intro", "title": "Introducción", "description": "Contexto y objetivos", "type": "intro", "needs_code": False, "needs_evidence": False},
-        {"id": "sec-dev", "title": "Desarrollo Técnico", "description": "Ejecución y evidencia", "type": "development", "needs_code": True, "needs_evidence": True},
-        {"id": "sec-conc", "title": "Conclusión", "description": "Síntesis de aprendizajes", "type": "conclusion", "needs_code": False, "needs_evidence": False},
-        {"id": "sec-bib", "title": "Bibliografía", "description": "Fuentes consultadas", "type": "references", "needs_code": False, "needs_evidence": False},
-    ]
+    outline = [item.model_dump() for item in request.initial_sections] if request.initial_sections else default_outline()
     project_id = store.create_project(
         title=request.title,
         subject=request.subject,
@@ -273,6 +265,74 @@ def quick_create_project(request: QuickCreateRequest) -> dict:
     }
 
 
+@app.post("/api/projects/import")
+async def import_project_offline(
+    title: str = Form(...),
+    file: UploadFile | None = File(None),
+    pauta_raw_text: str | None = Form(None),
+    subject: str = Form("General"),
+    student: str | None = Form(None),
+    career: str | None = Form(None),
+) -> dict:
+    clean_title = title.strip()
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="El título del proyecto es obligatorio en modo local.")
+    resolved_student = (student or settings.default_author or "Autor").strip()
+    resolved_career = (career or settings.default_career or "").strip()
+    filename = "pauta-pegada.txt"
+    temp_path: Path | None = None
+    try:
+        if file and file.filename:
+            filename = Path(file.filename).name
+            handle = tempfile.NamedTemporaryFile(delete=False, suffix=Path(filename).suffix)
+            handle.close()
+            temp_path = Path(handle.name)
+            save_upload(file, temp_path)
+            text_content = await run_in_threadpool(extract_text, temp_path, settings.max_source_chars)
+        else:
+            text_content = (pauta_raw_text or "").strip()
+        if len(text_content) < 10:
+            raise HTTPException(status_code=400, detail="No se pudo extraer texto suficiente de la pauta.")
+
+        outline = default_outline()
+        project_id = store.create_project(
+            title=clean_title,
+            subject=subject.strip() or "General",
+            student=resolved_student,
+            career=resolved_career,
+            summary="Proyecto importado localmente; pauta pendiente de desglosar en criterios.",
+            rubric_text=text_content,
+            deliverables=[],
+            outline=outline,
+        )
+        source_dir = settings.projects_dir / project_id / "sources"
+        if file and file.filename:
+            stored_path = save_content_addressed_upload(file, source_dir, filename)
+        else:
+            stored_path = source_dir / "pauta-pegada.txt"
+            stored_path.parent.mkdir(parents=True, exist_ok=True)
+            stored_path.write_text(text_content, encoding="utf-8")
+        store.add_source(project_id, stored_path, filename, "rubric_unparsed", text_content)
+        return {
+            "project_id": project_id,
+            "title": clean_title,
+            "subject": subject.strip() or "General",
+            "student": resolved_student,
+            "career": resolved_career,
+            "summary": "Proyecto importado localmente; pauta pendiente de desglosar en criterios.",
+            "deliverables": [],
+            "key_requirements": [],
+            "criteria": [],
+            "outline": outline,
+            "raw_pauta_full": text_content,
+            "requires_manual_rubric_review": True,
+            "ai_used": False,
+        }
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
 @app.patch("/api/projects/{project_id}/section")
 def update_project_section(project_id: str, request: SectionUpdateRequest) -> dict:
     project = require_project(project_id)
@@ -292,6 +352,127 @@ def update_project_section(project_id: str, request: SectionUpdateRequest) -> di
     }
 
 
+@app.get("/api/agent/projects/{project_id}/context")
+def agent_project_context(project_id: str) -> dict:
+    project = require_project(project_id)
+    artifacts = store.list_artifacts(project_id)
+    executions = store.list_executions(project_id, 50)
+    pending_criteria = [item for item in project["criteria"] if item.get("status") != "complete"]
+    return {
+        "schema_version": "1.0",
+        "project": project,
+        "pending_criteria": pending_criteria,
+        "artifacts": artifacts,
+        "recent_executions": executions,
+        "constraints": {
+            "completion_is_audit_controlled": True,
+            "artifact_validation_default": "unverified",
+            "evidence_content_requires_manual_review": True,
+        },
+        "operations": {
+            "update_section": f"/api/projects/{project_id}/section",
+            "attach_source": f"/api/agent/projects/{project_id}/sources",
+            "attach_artifact": f"/api/agent/projects/{project_id}/artifacts",
+            "register_execution": f"/api/agent/projects/{project_id}/executions",
+            "update_outline": f"/api/projects/{project_id}/outline",
+            "update_criteria": f"/api/projects/{project_id}/criteria",
+            "request_audit": f"/api/projects/{project_id}/audit",
+            "export_docx": f"/api/agent/projects/{project_id}/export-docx",
+            "package_submission": f"/api/agent/projects/{project_id}/package-submission",
+        },
+    }
+
+
+@app.post("/api/agent/projects/{project_id}/sources")
+async def agent_attach_source(
+    project_id: str,
+    file: UploadFile = File(...),
+    kind: str = Form("study_material"),
+) -> dict:
+    require_project(project_id)
+    filename = Path(file.filename or "source.txt").name
+    target_dir = settings.projects_dir / project_id / "sources"
+    try:
+        path = save_content_addressed_upload(file, target_dir, filename)
+        text = await run_in_threadpool(extract_text, path, settings.max_source_chars)
+        resolved_kind = kind.strip().lower() if kind and kind.strip() else classify_document(path)
+        source = store.add_source(project_id, path, filename, resolved_kind, text)
+        try:
+            source["embedded_chunks"] = await run_in_threadpool(index_source_embeddings, source["id"])
+        except Exception:
+            source["embedded_chunks"] = 0
+        return source
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"No se pudo indexar la fuente: {exc}") from exc
+
+
+@app.post("/api/agent/projects/{project_id}/artifacts")
+async def agent_attach_artifact(
+    project_id: str,
+    file: UploadFile = File(...),
+    kind: str = Form("other"),
+    criterion_id: str | None = Form(None),
+    source: str = Form("agent"),
+    description: str = Form(""),
+) -> dict:
+    project = require_project(project_id)
+    criterion_id = require_project_criterion(project, criterion_id)
+    normalized_kind = kind.strip().lower()
+    if normalized_kind not in AGENT_ARTIFACT_KINDS:
+        raise HTTPException(status_code=400, detail=f"Tipo de artefacto no permitido: {kind}")
+    filename = Path(file.filename or "").name
+    suffix = Path(filename).suffix.lower()
+    if not filename or suffix not in AGENT_ARTIFACT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="La extensión del artefacto no está permitida.")
+    normalized_source = source.strip()[:100]
+    if not normalized_source:
+        raise HTTPException(status_code=400, detail="El origen del artefacto es obligatorio.")
+    target_dir = settings.projects_dir / project_id / "artifacts"
+    stored_path = save_content_addressed_upload(file, target_dir, filename)
+    item = store.add_artifact(
+        project_id,
+        stored_path,
+        filename,
+        normalized_kind,
+        file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        normalized_source,
+        description.strip()[:5000],
+        criterion_id,
+    )
+    item["url"] = f"/api/agent/artifacts/{item['id']}/content"
+    return item
+
+
+@app.get("/api/agent/artifacts/{artifact_id}/content")
+def agent_artifact_content(artifact_id: str) -> FileResponse:
+    item = store.get_artifact(artifact_id)
+    if not item or not Path(item["stored_path"]).is_file():
+        raise HTTPException(status_code=404, detail="Artefacto no encontrado.")
+    return FileResponse(item["stored_path"], media_type=item["media_type"], filename=item["filename"])
+
+
+@app.post("/api/agent/projects/{project_id}/executions")
+def agent_register_execution(project_id: str, request: AgentExecutionRequest) -> dict:
+    project = require_project(project_id)
+    criterion_id = require_project_criterion(project, request.criterion_id)
+    if not store.artifacts_belong_to_project(project_id, request.artifact_ids):
+        raise HTTPException(status_code=400, detail="Uno o más artefactos no pertenecen al proyecto.")
+    if request.status == "succeeded" and request.exit_code not in {None, 0}:
+        raise HTTPException(status_code=400, detail="Una ejecución con código distinto de cero no puede declararse exitosa.")
+    return store.add_execution(
+        project_id,
+        agent=request.agent,
+        action=request.action,
+        status=request.status,
+        criterion_id=criterion_id,
+        command=request.command,
+        exit_code=request.exit_code,
+        stdout_excerpt=request.stdout_excerpt,
+        stderr_excerpt=request.stderr_excerpt,
+        artifact_ids=request.artifact_ids,
+    )
+
+
 
 
 @app.post("/api/analyze-rubric")
@@ -299,9 +480,11 @@ async def analyze_rubric(
     file: UploadFile | None = File(None),
     pauta_raw_text: str | None = Form(None),
     subject: str = Form(""),
-    student: str = Form("Nicolás Javier Jara Guzmán"),
-    career: str = Form("Ingeniería en Informática"),
+    student: str | None = Form(None),
+    career: str | None = Form(None),
 ) -> dict:
+    resolved_student = (student or settings.default_author or "Autor").strip()
+    resolved_career = (career or settings.default_career or "").strip()
     temp_path: Path | None = None
     filename = "pauta-pegada.txt"
     try:
@@ -323,8 +506,8 @@ async def analyze_rubric(
         project_id = store.create_project(
             title=analysis.title,
             subject=analysis.subject,
-            student=student,
-            career=career,
+            student=resolved_student,
+            career=resolved_career,
             summary=analysis.summary,
             rubric_text=text_content,
             deliverables=analysis.deliverables,
@@ -364,9 +547,8 @@ async def upload_sources(project_id: str, files: list[UploadFile] = File(...)) -
     target_dir = settings.projects_dir / project_id / "sources"
     for upload in files:
         filename = Path(upload.filename or "source.txt").name
-        path = target_dir / filename
-        save_upload(upload, path)
         try:
+            path = save_content_addressed_upload(upload, target_dir, filename)
             text = await run_in_threadpool(extract_text, path, settings.max_source_chars)
             source = store.add_source(project_id, path, filename, classify_document(path), text)
             try:
@@ -386,7 +568,7 @@ async def attach_library_source(project_id: str, request: LibraryAttachRequest) 
     try:
         path.relative_to(settings.library_root)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail="La fuente debe estar dentro de la biblioteca Iplacex.") from exc
+        raise HTTPException(status_code=400, detail="La fuente debe estar dentro de la biblioteca de estudio configurada.") from exc
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Archivo no encontrado.")
     text = await run_in_threadpool(extract_text, path, settings.max_source_chars)
@@ -404,31 +586,14 @@ def search_project_sources(project_id: str, q: str, limit: int = 8) -> dict:
     return {"results": store.search_sources(project_id, q, max(1, min(limit, 20)))}
 
 
-def section_prompt(request: GenerateRequest, card: dict, rubric_context: str, source_context: str, memory_context: str = "") -> str:
-    return f"""
-Redacta solamente una sección de un trabajo académico técnico para Iplacex.
+@app.delete("/api/projects/{project_id}/sources/{source_id}")
+def delete_project_source(project_id: str, source_id: str) -> dict:
+    require_project(project_id)
+    deleted = store.delete_source(project_id, source_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Fuente no encontrada.")
+    return {"status": "deleted", "id": source_id}
 
-TRABAJO: {request.title}
-ASIGNATURA: {request.subject}
-SECCIÓN: {card['title']}
-OBJETIVO: {card['description']}
-REQUIERE CÓDIGO: {card.get('needs_code', False)}
-REQUIERE CAPTURA/EVIDENCIA: {card.get('needs_evidence', False)}
-
-CRITERIOS RELACIONADOS:
-{rubric_context or 'No hay criterios específicos asociados.'}
-
-PREFERENCIAS O DECISIONES RECORDADAS DEL PROYECTO:
-{memory_context or 'Ninguna preferencia previa registrada.'}
-
-FRAGMENTOS DE FUENTES DISPONIBLES:
-{source_context or 'No se adjuntaron materiales adicionales. No inventes citas ni resultados de ejecución.'}
-
-Devuelve HTML semántico compatible con Tiptap. Comienza con h2 según corresponda y usa p, ul, ol,
-pre/code y blockquote. Si hace falta una captura real, inserta exactamente un blockquote que comience con
-"EVIDENCIA PENDIENTE:" y describa qué debe demostrar la captura; jamás inventes que una ejecución ocurrió.
-No inventes bibliografía. Cuando uses una fuente adjunta, cítala por su nombre de archivo en el texto.
-"""
 
 
 @app.post("/api/generate-document")
@@ -441,6 +606,10 @@ async def generate_document(request: GenerateRequest) -> dict:
         prompt = section_prompt(request, {"title": request.title, "description": outline, "needs_code": True,
                                                   "needs_evidence": True}, request.pauta_text[:16000], "")
         sections.append(clean_model_output(await run_in_threadpool(ai.text, prompt)))
+        html_content = "\n".join(sections)
+        if request.project_id:
+            store.update_document(request.project_id, html_content)
+            store.create_snapshot(request.project_id, html_content, "generated")
     else:
         for card_model in request.outline:
             card = card_model.model_dump()
@@ -458,14 +627,96 @@ async def generate_document(request: GenerateRequest) -> dict:
                 request.project_id, f"{card['title']} {card['description']}", 4
             ) if request.project_id else []
             memory_context = "\n".join(f"- {item['content']}" for item in memory_hits)
-            sections.append(clean_model_output(await run_in_threadpool(
-                ai.text, section_prompt(request, card, rubric_context, source_context, memory_context)
-            )))
-    html_content = "\n".join(sections)
-    if request.project_id:
-        store.create_snapshot(request.project_id, html_content, "generated")
+            try:
+                section_text = clean_model_output(await run_in_threadpool(
+                    ai.text, section_prompt(request, card, rubric_context, source_context, memory_context)
+                ))
+            except Exception as exc:
+                section_text = f"<h2>{html.escape(card['title'])}</h2><p><em>[Sección pendiente: no se pudo completar la generación automática ({html.escape(str(exc))}). Puedes redactar aquí o regenerar esta sección.]</em></p>"
+            sections.append(section_text)
+            if request.project_id:
+                store.update_document(request.project_id, "\n".join(sections))
+        html_content = "\n".join(sections)
+        if request.project_id:
+            store.create_snapshot(request.project_id, html_content, "generated")
     return {"project_id": request.project_id, "title": request.title, "subject": request.subject,
             "student": request.student, "career": request.career, "html_content": html_content}
+
+
+@app.post("/api/projects/{project_id}/regenerate-section")
+async def regenerate_section(project_id: str, request: RegenerateSectionRequest) -> dict:
+    project = require_project(project_id)
+    clean_heading = request.heading.strip()
+    if not clean_heading:
+        raise HTTPException(status_code=400, detail="El título de la sección es obligatorio.")
+
+    outline = project.get("outline") or []
+    target_card = None
+    for c in outline:
+        title = (c.get("title") or "").strip().lower()
+        if title == clean_heading.lower() or clean_heading.lower() in title or title in clean_heading.lower():
+            target_card = c
+            break
+
+    if not target_card:
+        target_card = {
+            "title": clean_heading,
+            "description": f"Sección de {clean_heading}",
+            "needs_code": True,
+            "needs_evidence": True,
+            "criterion_indexes": [],
+        }
+
+    criteria = project.get("criteria", [])
+    related = [criteria[index] for index in target_card.get("criterion_indexes", []) if index < len(criteria)]
+    rubric_context = "\n".join(
+        f"- {item['indicator']} ({item.get('points') or 'sin puntaje'} puntos)" for item in related
+    ) or (project.get("rubric_text") or "")[:5000]
+
+    search_query = f"{target_card['title']} {target_card.get('description', '')} {request.instruction or ''}".strip()
+    source_hits = await hybrid_source_search(project_id, search_query, 5)
+    source_context = "\n\n".join(
+        f"[Fuente: {hit['filename']}, fragmento {hit['chunk_index'] + 1}]\n{hit['content']}" for hit in source_hits
+    )[:14000]
+
+    memory_hits = await hybrid_memory_search(project_id, search_query, 4)
+    memory_context = "\n".join(f"- {item['content']}" for item in memory_hits)
+
+    gen_req = GenerateRequest(
+        project_id=project_id,
+        title=project.get("title") or "Documento",
+        subject=project.get("subject") or "General",
+        student=project.get("student") or settings.default_author or "Autor",
+        career=project.get("career") or "",
+        outline=[],
+        pauta_text=project.get("rubric_text") or "",
+    )
+
+    prompt = section_prompt(gen_req, target_card, rubric_context, source_context, memory_context)
+    if request.instruction:
+        prompt += f"\nINSTRUCCIÓN ADICIONAL DEL USUARIO:\n{request.instruction.strip()}\n"
+
+    new_section_html = clean_model_output(await run_in_threadpool(ai.text, prompt))
+    persisted_html = project.get("document_html") or ""
+    current_html = (
+        request.current_html_content
+        if request.current_html_content is not None
+        else persisted_html
+    )
+    if request.current_html_content is not None and request.current_html_content != persisted_html:
+        store.create_snapshot(project_id, current_html, f"before_regen:{clean_heading[:20]}")
+
+    updated_doc_html = update_html_section(current_html, clean_heading, new_section_html)
+    version = store.create_snapshot(project_id, updated_doc_html, f"regen:{clean_heading[:25]}")
+
+    return {
+        "status": "regenerated",
+        "project_id": project_id,
+        "heading": clean_heading,
+        "section_html": new_section_html,
+        "html_content": updated_doc_html,
+        "version": version,
+    }
 
 
 @app.post("/api/refine-text")
@@ -564,57 +815,22 @@ sesiones futuras. Usa suggested_actions únicamente si hay una edición concreta
 """
     result = await run_in_threadpool(ai.chat, prompt)
     store.add_message(project_id, "assistant", result.answer)
-    memory_contents = result.memories_to_store[:5]
-    memory_vectors: list[list[float]] = []
-    if memory_contents:
-        try:
-            memory_vectors = await run_in_threadpool(
-                ai.embed_documents, memory_contents, ["memoria del proyecto"] * len(memory_contents)
-            )
-        except Exception:
-            memory_vectors = []
-    for index, content in enumerate(memory_contents):
-        embedding = memory_vectors[index] if index < len(memory_vectors) else None
-        store.add_memory(project_id, "decision", content, 0.7, "assistant", embedding,
-                         settings.embedding_model if embedding else None)
     return result
 
 
-def offline_audit(project: dict, html_content: str) -> AuditResult:
-    text = BeautifulSoup(html_content, "html.parser").get_text(" ", strip=True).lower()
-    has_evidence = "evidencia pendiente" not in text and ("captura" in text or "figura" in text)
-    items = []
-    earned = 0.0
-    possible = 0.0
-    for criterion in project["criteria"]:
-        words = {word for word in re.findall(r"\w+", criterion["indicator"].lower()) if len(word) > 4}
-        ratio = sum(1 for word in words if word in text) / max(len(words), 1)
-        evidence_ok = not criterion["requires_evidence"] or has_evidence
-        status = "complete" if ratio >= 0.45 and evidence_ok else "partial" if ratio >= 0.2 else "missing"
-        feedback = ("Hay cobertura textual y evidencia aparente; revísala manualmente." if status == "complete"
-                    else "Falta evidencia real." if criterion["requires_evidence"] and not evidence_ok
-                    else "El indicador no está cubierto con suficiente claridad.")
-        points = float(criterion.get("points") or 0)
-        possible += points
-        earned += points * ({"complete": 1, "partial": 0.5, "missing": 0}[status])
-        items.append(AuditItem(criterion_id=criterion["id"], status=status,
-                               evidence_found=evidence_ok, feedback=feedback))
-    score = earned / possible * 100 if possible else (
-        sum({"complete": 1, "partial": 0.5, "missing": 0}[item.status] for item in items)
-        / max(len(items), 1) * 100
-    )
-    return AuditResult(summary="Auditoría local preliminar; confirma manualmente las evidencias.",
-                       estimated_score=score, items=items)
 
 
 @app.post("/api/projects/{project_id}/audit", response_model=AuditResult)
 async def audit_project(project_id: str, request: AuditRequest) -> AuditResult:
     project = require_project(project_id)
-    result = offline_audit(project, request.html_content)
+    fallback = offline_audit(project, request.html_content)
+    result = fallback
     if request.use_ai and get_gemini_api_key():
+        evidence_counts = valid_evidence_by_criterion(project)
         criteria_text = "\n".join(
             f"- criterion_id={item['id']} | indicador={item['indicator']} | puntos={item.get('points')} | "
-            f"requiere_evidencia={bool(item['requires_evidence'])}" for item in project["criteria"]
+            f"requiere_evidencia={bool(item['requires_evidence'])} | "
+            f"archivos_vinculados={len(evidence_counts.get(item['id'], []))}" for item in project["criteria"]
         )
         prompt = f"""
 Audita el documento contra cada indicador. No concedas cumplimiento por promesas o marcadores de evidencia.
@@ -628,6 +844,7 @@ DOCUMENTO:
             result = await run_in_threadpool(ai.audit, prompt)
         except Exception:
             pass
+    result = enforce_evidence_grounding(project, result, fallback)
     store.update_audit(project_id, [item.model_dump() for item in result.items])
     return result
 
@@ -638,8 +855,11 @@ async def upload_evidence(
     file: UploadFile = File(...),
     caption: str = Form(""),
     criterion_id: str | None = Form(None),
+    watermark: bool = Form(False),
+    watermark_text: str | None = Form(None),
 ) -> dict:
-    require_project(project_id)
+    project = require_project(project_id)
+    resolved_criterion_id = require_project_criterion(project, criterion_id)
     filename = Path(file.filename or "evidence.png").name
     suffix = Path(filename).suffix.lower()
     if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -647,9 +867,41 @@ async def upload_evidence(
     stem = re.sub(r"[^a-zA-Z0-9_-]", "_", Path(filename).stem)[:40]
     target = settings.projects_dir / project_id / "evidence" / f"{stem}_{os.urandom(5).hex()}{suffix}"
     save_upload(file, target)
-    item = store.add_evidence(project_id, target, filename, caption, criterion_id)
-    item["url"] = f"/api/evidence/{item['id']}/content"
-    return item
+
+    try:
+        if watermark:
+            student_name = project.get("student") or settings.default_author or "Autor"
+            institution_name = project.get("institution") or settings.default_institution or "DocStudio"
+            resolved_text = (watermark_text or f"{student_name} - {institution_name}").strip()
+            try:
+                apply_watermark(target, resolved_text)
+            except Exception:
+                pass
+
+        item = store.add_evidence(project_id, target, filename, caption, resolved_criterion_id)
+        item["url"] = f"/api/evidence/{item['id']}/content"
+        return item
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+
+
+@app.post("/api/projects/{project_id}/evidence/{evidence_id}/watermark")
+def watermark_existing_evidence(
+    project_id: str,
+    evidence_id: str,
+    watermark_text: str | None = None,
+) -> dict:
+    project = require_project(project_id)
+    item = store.get_evidence(evidence_id)
+    if not item or not Path(item["stored_path"]).is_file():
+        raise HTTPException(status_code=404, detail="Evidencia no encontrada.")
+    student_name = project.get("student") or settings.default_author or "Autor"
+    institution_name = project.get("institution") or settings.default_institution or "DocStudio"
+    resolved_text = (watermark_text or f"{student_name} - {institution_name}").strip()
+    apply_watermark(item["stored_path"], resolved_text)
+    return {"status": "watermarked", "evidence_id": evidence_id, "url": f"/api/evidence/{evidence_id}/content"}
+
 
 
 @app.get("/api/evidence/{evidence_id}/content")
@@ -661,95 +913,16 @@ def evidence_content(evidence_id: str) -> FileResponse:
     return FileResponse(item["stored_path"], media_type=media_type, filename=item["filename"])
 
 
-def parse_html_to_sections(html_content: str) -> list[dict]:
-    soup = BeautifulSoup(html_content or "", "html.parser")
-    sections: list[dict] = []
-    root = soup.body or soup
-    mapping = {"h1": "h1", "h2": "h2", "h3": "h3", "pre": "code", "blockquote": "callout", "p": "paragraph"}
-
-    def process_node(node: Tag) -> None:
-        tag = node.name.lower()
-        if tag in {"ul", "ol"}:
-            section_type = "ordered_item" if tag == "ol" else "list_item"
-            for li in node.find_all("li", recursive=False):
-                sections.append({
-                    "type": section_type,
-                    "content": li.get_text(" ", strip=True),
-                    "content_html": str(li),
-                })
-            return
-
-        if tag == "img":
-            sections.append({
-                "type": "image",
-                "content": "",
-                "image_path": node.get("src"),
-                "image_alt": node.get("alt"),
-            })
-            return
-
-        # If a block contains img tags, separate them cleanly so images are never lost
-        if node.find("img"):
-            for child in list(node.children):
-                if isinstance(child, NavigableString):
-                    text = str(child).strip()
-                    if text:
-                        sections.append({
-                            "type": mapping.get(tag, "paragraph"),
-                            "content": text,
-                            "content_html": f"<{tag}>{html.escape(text)}</{tag}>",
-                        })
-                elif isinstance(child, Tag):
-                    if child.name.lower() == "img":
-                        sections.append({
-                            "type": "image",
-                            "content": "",
-                            "image_path": child.get("src"),
-                            "image_alt": child.get("alt"),
-                        })
-                    else:
-                        if child.find("img"):
-                            process_node(child)
-                        else:
-                            child_text = child.get_text(" ", strip=True)
-                            if child_text:
-                                sections.append({
-                                    "type": mapping.get(tag, "paragraph"),
-                                    "content": child_text,
-                                    "content_html": str(child),
-                                })
-            return
-
-        if tag not in mapping:
-            for child in node.children:
-                if isinstance(child, Tag):
-                    process_node(child)
-            return
-
-        content = node.get_text("\n" if tag == "pre" else " ", strip=True)
-        if content:
-            sections.append({
-                "type": mapping[tag],
-                "content": content,
-                "content_html": str(node),
-            })
-
-    for top_child in root.children:
-        if isinstance(top_child, Tag):
-            process_node(top_child)
-
-    return sections
-
-
+@app.delete("/api/projects/{project_id}/evidence/{evidence_id}")
+def delete_project_evidence(project_id: str, evidence_id: str) -> dict:
+    require_project(project_id)
+    deleted = store.delete_evidence(project_id, evidence_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Evidencia no encontrada.")
+    return {"status": "deleted", "id": evidence_id}
 
 def resolve_image_path(value: str | None) -> str | None:
-    if not value:
-        return None
-    match = re.search(r"/api/evidence/([^/]+)/content", html.unescape(value))
-    if match:
-        evidence = store.get_evidence(match.group(1))
-        return evidence["stored_path"] if evidence else None
-    return value if Path(value).is_file() else None
+    return _resolve_image_path(value, get_evidence=store.get_evidence, get_artifact=store.get_artifact)
 
 
 @app.post("/api/export-docx")
@@ -763,15 +936,128 @@ async def export_docx(request: ExportDocxRequest) -> FileResponse:
     for section in sections:
         if section.get("type") == "image":
             section["image_path"] = resolve_image_path(section.get("image_path"))
-    filename_stem = re.sub(r'[\\/*?:"<>|]', "", request.title or "Trabajo Iplacex")[:60].strip()
+    filename_stem = re.sub(r'[\\/*?:"<>|]', "", request.title or "Documento Tecnico")[:60].strip()
     output_dir = settings.projects_dir / (request.project_id or "exports") / "exports"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{filename_stem}.docx"
     data = request.model_dump(exclude={"html_content", "sections"})
     data["sections"] = sections
-    await run_in_threadpool(create_iplacex_document, data, str(output_path))
+    await run_in_threadpool(create_docx_document, data, str(output_path))
     return FileResponse(output_path, filename=output_path.name,
                         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+
+@app.post("/api/projects/{project_id}/package-submission")
+async def package_submission(
+    project_id: str,
+    request: PackageSubmissionRequest | None = None,
+) -> FileResponse:
+    project = require_project(project_id)
+    html_content = (request.html_content if request and request.html_content else project.get("document_html")) or "<p>Documento inicial.</p>"
+
+    sections = parse_html_to_sections(html_content)
+    for section in sections:
+        if section.get("type") == "image":
+            section["image_path"] = resolve_image_path(section.get("image_path"))
+
+    filename_stem = re.sub(r'[\\/*?:"<>|]', "", project.get("title") or "Entrega")[:60].strip() or "Entrega"
+    output_dir = settings.projects_dir / project_id / "exports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    docx_path = output_dir / f"{filename_stem}.docx"
+
+    doc_data = {
+        "title": project.get("title") or "Entrega",
+        "subject": project.get("subject") or "General",
+        "student": project.get("student") or settings.default_author or "Autor",
+        "career": project.get("career") or settings.default_career or "",
+        "institution": project.get("institution") or settings.default_institution or "",
+        "sections": sections,
+    }
+    await run_in_threadpool(create_docx_document, doc_data, str(docx_path))
+
+    include_sources = request.include_sources if request else True
+    zip_path, zip_filename = await run_in_threadpool(
+        package_project_submission, project_id, store, docx_path, include_sources
+    )
+
+    return FileResponse(zip_path, filename=zip_filename, media_type="application/zip")
+
+
+@app.post("/api/agent/projects/{project_id}/export-docx")
+async def agent_export_docx(
+    project_id: str,
+    output_path: str | None = None,
+) -> dict:
+    project = require_project(project_id)
+    html_content = project.get("document_html") or "<p>Documento vacío.</p>"
+    sections = parse_html_to_sections(html_content)
+    for section in sections:
+        if section.get("type") == "image":
+            section["image_path"] = resolve_image_path(section.get("image_path"))
+
+    filename_stem = re.sub(r'[\\/*?:"<>|]', "", project.get("title") or "Documento Tecnico")[:60].strip() or "Documento"
+    if output_path:
+        out = Path(output_path).resolve()
+    else:
+        output_dir = settings.projects_dir / project_id / "exports"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out = output_dir / f"{filename_stem}.docx"
+
+    doc_data = {
+        "title": project.get("title") or "Documento Técnico",
+        "subject": project.get("subject") or "General",
+        "student": project.get("student") or settings.default_author or "Autor",
+        "career": project.get("career") or settings.default_career or "",
+        "institution": project.get("institution") or settings.default_institution or "",
+        "sections": sections,
+    }
+    await run_in_threadpool(create_docx_document, doc_data, str(out))
+    return {
+        "status": "ok",
+        "project_id": project_id,
+        "file_path": str(out),
+        "filename": out.name,
+        "size_bytes": out.stat().st_size if out.is_file() else 0,
+    }
+
+
+@app.post("/api/agent/projects/{project_id}/package-submission")
+async def agent_package_submission(
+    project_id: str,
+    include_sources: bool = True,
+) -> dict:
+    project = require_project(project_id)
+    html_content = project.get("document_html") or "<p>Documento inicial.</p>"
+    sections = parse_html_to_sections(html_content)
+    for section in sections:
+        if section.get("type") == "image":
+            section["image_path"] = resolve_image_path(section.get("image_path"))
+
+    filename_stem = re.sub(r'[\\/*?:"<>|]', "", project.get("title") or "Entrega")[:60].strip() or "Entrega"
+    output_dir = settings.projects_dir / project_id / "exports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    docx_path = output_dir / f"{filename_stem}.docx"
+
+    doc_data = {
+        "title": project.get("title") or "Entrega",
+        "subject": project.get("subject") or "General",
+        "student": project.get("student") or settings.default_author or "Autor",
+        "career": project.get("career") or settings.default_career or "",
+        "institution": project.get("institution") or settings.default_institution or "",
+        "sections": sections,
+    }
+    await run_in_threadpool(create_docx_document, doc_data, str(docx_path))
+
+    zip_path, zip_filename = await run_in_threadpool(
+        package_project_submission, project_id, store, docx_path, include_sources
+    )
+    return {
+        "status": "ok",
+        "project_id": project_id,
+        "zip_path": str(zip_path),
+        "filename": zip_filename,
+        "size_bytes": zip_path.stat().st_size if zip_path.is_file() else 0,
+    }
 
 
 if __name__ == "__main__":

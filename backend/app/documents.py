@@ -8,7 +8,7 @@ import pypdf
 from docx import Document
 
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".sql", ".py", ".java", ".cs"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".sql", ".py", ".java", ".cs", ".xlsx"}
 
 
 def sha256_file(path: Path) -> str:
@@ -42,6 +42,28 @@ def extract_text(path: Path, max_chars: int = 120_000) -> str:
                 values = [cell.text.strip() for cell in row.cells]
                 if any(values):
                     parts.append(" | ".join(values))
+        result = "\n".join(parts)
+    elif suffix == ".xlsx":
+        import openpyxl
+        wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+        parts = []
+        try:
+            for sheetname in wb.sheetnames:
+                sheet = wb[sheetname]
+                parts.append(f"[Hoja: {sheetname}]")
+                row_count = 0
+                for row in sheet.iter_rows(values_only=True):
+                    vals = [str(v).strip() if v is not None else "" for v in row]
+                    if any(vals):
+                        parts.append(" | ".join(vals))
+                        row_count += 1
+                    if row_count >= 1000:
+                        parts.append("[... Filas truncadas para indexación ...]")
+                        break
+                if sum(len(p) for p in parts) >= max_chars:
+                    break
+        finally:
+            wb.close()
         result = "\n".join(parts)
     elif suffix in SUPPORTED_EXTENSIONS:
         result = path.read_text(encoding="utf-8", errors="replace")
@@ -89,7 +111,7 @@ def list_library_files(root: Path, limit: int = 500) -> list[dict]:
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
-        if "gamma-iplacex" in path.parts:
+        if any(ignored in path.parts for ignored in ("docstudio", ".git", ".venv", "node_modules", "data")):
             continue
         stat = path.stat()
         files.append(

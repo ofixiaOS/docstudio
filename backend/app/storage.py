@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -131,11 +132,41 @@ class Store:
                     caption TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    criterion_id TEXT REFERENCES rubric_criteria(id) ON DELETE SET NULL,
+                    kind TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    media_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+                    source TEXT NOT NULL DEFAULT 'agent',
+                    description TEXT NOT NULL DEFAULT '',
+                    validation_status TEXT NOT NULL DEFAULT 'unverified',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS execution_records (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    criterion_id TEXT REFERENCES rubric_criteria(id) ON DELETE SET NULL,
+                    agent TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('succeeded','failed','partial')),
+                    command TEXT NOT NULL DEFAULT '',
+                    exit_code INTEGER,
+                    stdout_excerpt TEXT NOT NULL DEFAULT '',
+                    stderr_excerpt TEXT NOT NULL DEFAULT '',
+                    artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_projects_updated ON projects(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_criteria_project ON rubric_criteria(project_id, position);
                 CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id, importance DESC);
                 CREATE INDEX IF NOT EXISTS idx_chunks_project ON source_chunks(project_id);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_executions_project ON execution_records(project_id, created_at DESC);
                 """
             )
             project_columns = {row["name"] for row in db.execute("PRAGMA table_info(projects)").fetchall()}
@@ -150,6 +181,10 @@ class Store:
                 db.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS source_chunks_fts USING fts5("
                     "chunk_id UNINDEXED, project_id UNINDEXED, content, tokenize='unicode61 remove_diacritics 2')"
+                )
+                db.execute(
+                    "CREATE TRIGGER IF NOT EXISTS trg_source_chunks_delete AFTER DELETE ON source_chunks "
+                    "BEGIN DELETE FROM source_chunks_fts WHERE chunk_id = OLD.id; END"
                 )
                 self.fts_enabled = True
             except sqlite3.OperationalError:
@@ -195,33 +230,159 @@ class Store:
             evidence = [dict(row) for row in db.execute(
                 "SELECT * FROM evidence_files WHERE project_id=? ORDER BY created_at DESC", (project_id,)
             ).fetchall()]
+            artifacts = [dict(row) for row in db.execute(
+                "SELECT * FROM artifacts WHERE project_id=? ORDER BY created_at DESC", (project_id,)
+            ).fetchall()]
+            executions = [dict(row) for row in db.execute(
+                "SELECT * FROM execution_records WHERE project_id=? ORDER BY created_at DESC LIMIT 50", (project_id,)
+            ).fetchall()]
+        for ex in executions:
+            ex["artifact_ids"] = json.loads(ex.pop("artifact_ids_json") or "[]")
         project["deliverables"] = json.loads(project.pop("deliverables_json") or "[]")
         project["outline"] = json.loads(project.pop("outline_json") or "[]")
         project["criteria"] = criteria
         project["sources"] = sources
         project["evidence"] = evidence
+        project["artifacts"] = artifacts
+        project["executions"] = executions
         return project
+
+    def delete_project(self, project_id: str) -> bool:
+        with self.connect() as db:
+            cursor = db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+            deleted = cursor.rowcount > 0
+        if deleted:
+            if self.fts_enabled:
+                try:
+                    with self.connect() as db:
+                        db.execute("DELETE FROM source_chunks_fts WHERE project_id=?", (project_id,))
+                except Exception:
+                    pass
+            project_dir = self.database_path.parent / "projects" / project_id
+            if project_dir.exists() and project_dir.is_dir():
+                shutil.rmtree(project_dir, ignore_errors=True)
+        return deleted
 
     def add_criteria(self, project_id: str, criteria: list[dict[str, Any]]) -> list[dict[str, Any]]:
         created = []
         with self.connect() as db:
-            for position, item in enumerate(criteria):
-                criterion_id = new_id("crit")
+            current_max = db.execute(
+                "SELECT COALESCE(MAX(position), -1) FROM rubric_criteria WHERE project_id=?", (project_id,)
+            ).fetchone()[0]
+            start_pos = int(current_max) + 1
+            for offset, item in enumerate(criteria):
+                position = start_pos + offset
+                criterion_id = (item.get("id") or "").strip() or new_id("crit")
+                status = item.get("status") or "pending"
+                feedback = item.get("feedback") or ""
                 db.execute(
                     "INSERT INTO rubric_criteria(id,project_id,position,criterion,indicator,points,requires_evidence,"
-                    "evidence_description,deliverable) VALUES(?,?,?,?,?,?,?,?,?)",
+                    "evidence_description,deliverable,status,feedback) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (criterion_id, project_id, position, item.get("criterion", ""), item.get("indicator", ""),
                      item.get("points"), int(bool(item.get("requires_evidence"))),
-                     item.get("evidence_description"), item.get("deliverable")),
+                     item.get("evidence_description"), item.get("deliverable"), status, feedback),
                 )
-                created.append({"id": criterion_id, **item, "position": position, "status": "pending", "feedback": ""})
+                created.append({**item, "id": criterion_id, "position": position, "status": status, "feedback": feedback})
+            db.execute("UPDATE projects SET updated_at=? WHERE id=?", (utcnow(), project_id))
         return created
+
+
+    def replace_criteria(self, project_id: str, criteria: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            existing_rows = db.execute(
+                "SELECT id, status, feedback FROM rubric_criteria WHERE project_id=?", (project_id,)
+            ).fetchall()
+            existing_map = {row["id"]: dict(row) for row in existing_rows}
+
+            incoming_ids: set[str] = set()
+            for item in criteria:
+                cid = (item.get("id") or "").strip()
+                if cid and cid in existing_map:
+                    incoming_ids.add(cid)
+
+            if incoming_ids:
+                placeholders = ",".join("?" for _ in incoming_ids)
+                db.execute(
+                    f"DELETE FROM rubric_criteria WHERE project_id=? AND id NOT IN ({placeholders})",
+                    (project_id, *incoming_ids),
+                )
+            else:
+                db.execute("DELETE FROM rubric_criteria WHERE project_id=?", (project_id,))
+
+            result: list[dict[str, Any]] = []
+            for position, item in enumerate(criteria):
+                cid = (item.get("id") or "").strip()
+                if cid and cid in existing_map:
+                    status = item.get("status") or existing_map[cid]["status"] or "pending"
+                    feedback = item.get("feedback") if item.get("feedback") is not None else existing_map[cid]["feedback"]
+                    db.execute(
+                        "UPDATE rubric_criteria SET position=?, criterion=?, indicator=?, points=?, "
+                        "requires_evidence=?, evidence_description=?, deliverable=?, status=?, feedback=? "
+                        "WHERE id=? AND project_id=?",
+                        (
+                            position,
+                            item.get("criterion", ""),
+                            item.get("indicator", ""),
+                            item.get("points"),
+                            int(bool(item.get("requires_evidence"))),
+                            item.get("evidence_description"),
+                            item.get("deliverable"),
+                            status,
+                            feedback,
+                            cid,
+                            project_id,
+                        ),
+                    )
+                    result.append({
+                        **item,
+                        "id": cid,
+                        "position": position,
+                        "status": status,
+                        "feedback": feedback,
+                    })
+                else:
+                    criterion_id = cid or new_id("crit")
+                    status = item.get("status") or "pending"
+                    feedback = item.get("feedback") or ""
+                    db.execute(
+                        "INSERT INTO rubric_criteria(id,project_id,position,criterion,indicator,points,requires_evidence,"
+                        "evidence_description,deliverable,status,feedback) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            criterion_id,
+                            project_id,
+                            position,
+                            item.get("criterion", ""),
+                            item.get("indicator", ""),
+                            item.get("points"),
+                            int(bool(item.get("requires_evidence"))),
+                            item.get("evidence_description"),
+                            item.get("deliverable"),
+                            status,
+                            feedback,
+                        ),
+                    )
+                    result.append({
+                        **item,
+                        "id": criterion_id,
+                        "position": position,
+                        "status": status,
+                        "feedback": feedback,
+                    })
+            db.execute("UPDATE projects SET updated_at=? WHERE id=?", (utcnow(), project_id))
+        return result
 
     def update_document(self, project_id: str, html_content: str) -> None:
         with self.connect() as db:
             db.execute(
                 "UPDATE projects SET document_html=?, updated_at=? WHERE id=?",
                 (html_content, utcnow(), project_id),
+            )
+
+    def update_outline(self, project_id: str, outline: list[dict[str, Any]]) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE projects SET outline_json=?, updated_at=? WHERE id=?",
+                (json.dumps(outline, ensure_ascii=False), utcnow(), project_id),
             )
 
     def create_snapshot(self, project_id: str, html_content: str, reason: str) -> int:
@@ -258,13 +419,39 @@ class Store:
             ).fetchone()
         return self._row(row)
 
-    def restore_version(self, project_id: str, version_number: int) -> dict[str, Any]:
-        target = self.get_version(project_id, version_number)
-        if not target:
-            raise ValueError(f"Versión {version_number} no encontrada.")
-        new_version = self.create_snapshot(project_id, target["html_content"], f"restored_from_v{version_number}")
+    def restore_version(self, project_id: str, version_number: int,
+                        current_html_content: str | None = None) -> dict[str, Any]:
+        with self.connect() as db:
+            target = db.execute(
+                "SELECT * FROM project_versions WHERE project_id=? AND version_number=?",
+                (project_id, version_number),
+            ).fetchone()
+            if not target:
+                raise ValueError(f"Versión {version_number} no encontrada.")
+            project = db.execute(
+                "SELECT document_html FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            if not project:
+                raise ValueError("Proyecto no encontrado.")
+
+            backup_html = project["document_html"] if current_html_content is None else current_html_content
+            current = db.execute(
+                "SELECT COALESCE(MAX(version_number),0) FROM project_versions WHERE project_id=?", (project_id,)
+            ).fetchone()[0]
+            backup_version = int(current) + 1
+            now = utcnow()
+            db.execute(
+                "INSERT INTO project_versions(id,project_id,version_number,reason,html_content,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (new_id("ver"), project_id, backup_version, f"before_restore_v{version_number}", backup_html, now),
+            )
+            db.execute(
+                "UPDATE projects SET document_html=?, updated_at=? WHERE id=?",
+                (target["html_content"], now, project_id),
+            )
         return {
-            "version_number": new_version,
+            "version_number": backup_version,
+            "backup_version_number": backup_version,
             "restored_from": version_number,
             "html_content": target["html_content"],
         }
@@ -413,6 +600,26 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def delete_source(self, project_id: str, source_id: str) -> bool:
+        with self.connect() as db:
+            row = db.execute("SELECT path FROM source_documents WHERE id=? AND project_id=?", (source_id, project_id)).fetchone()
+            if not row:
+                return False
+            path = Path(row["path"]).resolve()
+            db.execute("DELETE FROM source_documents WHERE id=? AND project_id=?", (source_id, project_id))
+            # Protect external files: only unlink if stored inside this project's directory
+            project_dir = (self.database_path.parent / "projects" / project_id).resolve()
+            try:
+                is_internal = path.is_relative_to(project_dir)
+            except AttributeError:
+                is_internal = str(path).startswith(str(project_dir))
+            if is_internal and path.exists() and path.is_file():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+            return True
+
     def set_chunk_embeddings(self, items: list[tuple[str, list[float]]], model: str) -> None:
         with self.connect() as db:
             db.executemany(
@@ -437,12 +644,23 @@ class Store:
                     (fts_query, project_id, limit),
                 ).fetchall()
             else:
-                rows = db.execute(
-                    "SELECT sc.id,sc.chunk_index,sc.content,sd.filename,sd.path,sd.kind,NULL AS rank "
-                    "FROM source_chunks sc JOIN source_documents sd ON sd.id=sc.source_document_id "
-                    "WHERE sc.project_id=? AND lower(sc.content) LIKE ? LIMIT ?",
-                    (project_id, f"%{query.lower()}%", limit),
-                ).fetchall()
+                tokens = [token for token in re.findall(r"\w+", query.lower(), flags=re.UNICODE) if len(token) > 2]
+                if tokens:
+                    clauses = " OR ".join("lower(sc.content) LIKE ?" for _ in tokens[:12])
+                    params: list[Any] = [project_id, *[f"%{t}%" for t in tokens[:12]], limit]
+                    rows = db.execute(
+                        "SELECT sc.id,sc.chunk_index,sc.content,sd.filename,sd.path,sd.kind,NULL AS rank "
+                        "FROM source_chunks sc JOIN source_documents sd ON sd.id=sc.source_document_id "
+                        f"WHERE sc.project_id=? AND ({clauses}) LIMIT ?",
+                        params,
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        "SELECT sc.id,sc.chunk_index,sc.content,sd.filename,sd.path,sd.kind,NULL AS rank "
+                        "FROM source_chunks sc JOIN source_documents sd ON sd.id=sc.source_document_id "
+                        "WHERE sc.project_id=? AND lower(sc.content) LIKE ? LIMIT ?",
+                        (project_id, f"%{query.lower()}%", limit),
+                    ).fetchall()
         return [dict(row) for row in rows]
 
     def search_sources_vector(self, project_id: str, query_embedding: list[float], limit: int = 8) -> list[dict[str, Any]]:
@@ -470,7 +688,8 @@ class Store:
 
     def add_evidence(self, project_id: str, stored_path: Path, filename: str,
                      caption: str, criterion_id: str | None) -> dict[str, Any]:
-        item = {"id": new_id("ev"), "project_id": project_id, "criterion_id": criterion_id,
+        normalized_criterion_id = (criterion_id or "").strip() or None
+        item = {"id": new_id("ev"), "project_id": project_id, "criterion_id": normalized_criterion_id,
                 "filename": filename, "stored_path": str(stored_path), "caption": caption, "created_at": utcnow()}
         with self.connect() as db:
             db.execute(
@@ -482,3 +701,114 @@ class Store:
     def get_evidence(self, evidence_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
             return self._row(db.execute("SELECT * FROM evidence_files WHERE id=?", (evidence_id,)).fetchone())
+
+    def list_evidence(self, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM evidence_files WHERE project_id=? ORDER BY created_at DESC", (project_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_evidence(self, project_id: str, evidence_id: str) -> bool:
+        with self.connect() as db:
+            row = db.execute("SELECT stored_path FROM evidence_files WHERE id=? AND project_id=?", (evidence_id, project_id)).fetchone()
+            if not row:
+                return False
+            path = Path(row["stored_path"])
+            db.execute("DELETE FROM evidence_files WHERE id=? AND project_id=?", (evidence_id, project_id))
+            if path.exists() and path.is_file():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+            return True
+
+    def add_artifact(self, project_id: str, stored_path: Path, filename: str, kind: str,
+                     media_type: str, source: str, description: str,
+                     criterion_id: str | None = None) -> dict[str, Any]:
+        item = {
+            "id": new_id("art"),
+            "project_id": project_id,
+            "criterion_id": criterion_id,
+            "kind": kind,
+            "filename": filename,
+            "stored_path": str(stored_path),
+            "sha256": sha256_file(stored_path),
+            "media_type": media_type,
+            "source": source,
+            "description": description,
+            "validation_status": "unverified",
+            "created_at": utcnow(),
+        }
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO artifacts(id,project_id,criterion_id,kind,filename,stored_path,sha256,media_type,"
+                "source,description,validation_status,created_at) "
+                "VALUES(:id,:project_id,:criterion_id,:kind,:filename,:stored_path,:sha256,:media_type,"
+                ":source,:description,:validation_status,:created_at)",
+                item,
+            )
+        return item
+
+    def list_artifacts(self, project_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM artifacts WHERE project_id=? ORDER BY created_at DESC", (project_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            return self._row(db.execute("SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone())
+
+    def artifacts_belong_to_project(self, project_id: str, artifact_ids: list[str]) -> bool:
+        unique_ids = list(dict.fromkeys(artifact_ids))
+        if not unique_ids:
+            return True
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connect() as db:
+            count = db.execute(
+                f"SELECT COUNT(*) FROM artifacts WHERE project_id=? AND id IN ({placeholders})",
+                (project_id, *unique_ids),
+            ).fetchone()[0]
+        return count == len(unique_ids)
+
+    def add_execution(self, project_id: str, *, agent: str, action: str, status: str,
+                      criterion_id: str | None, command: str, exit_code: int | None,
+                      stdout_excerpt: str, stderr_excerpt: str,
+                      artifact_ids: list[str]) -> dict[str, Any]:
+        item = {
+            "id": new_id("run"),
+            "project_id": project_id,
+            "criterion_id": criterion_id,
+            "agent": agent,
+            "action": action,
+            "status": status,
+            "command": command,
+            "exit_code": exit_code,
+            "stdout_excerpt": stdout_excerpt,
+            "stderr_excerpt": stderr_excerpt,
+            "artifact_ids_json": json.dumps(artifact_ids, ensure_ascii=False),
+            "created_at": utcnow(),
+        }
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO execution_records(id,project_id,criterion_id,agent,action,status,command,exit_code,"
+                "stdout_excerpt,stderr_excerpt,artifact_ids_json,created_at) "
+                "VALUES(:id,:project_id,:criterion_id,:agent,:action,:status,:command,:exit_code,"
+                ":stdout_excerpt,:stderr_excerpt,:artifact_ids_json,:created_at)",
+                item,
+            )
+        item["artifact_ids"] = json.loads(item.pop("artifact_ids_json"))
+        return item
+
+    def list_executions(self, project_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM execution_records WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
+                (project_id, limit),
+            ).fetchall()
+        items = [dict(row) for row in rows]
+        for item in items:
+            item["artifact_ids"] = json.loads(item.pop("artifact_ids_json") or "[]")
+        return items

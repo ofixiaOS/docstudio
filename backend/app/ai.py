@@ -48,13 +48,20 @@ class GeminiService:
         return (response.text or "").strip()
 
     def analyze_rubric(self, text: str, subject_hint: str = "") -> RubricAnalysis:
+        institution = settings.default_institution or "educación superior técnica y profesional"
         prompt = f"""
-Actúa como analista de requisitos académicos de Iplacex. Convierte la pauta en datos verificables.
+Actúa como analista riguroso de requisitos académicos y técnicos para {institution}.
+Convierte la pauta en datos estructurados y verificables.
 No inventes requisitos ni puntajes. Distingue claramente el documento de respaldo de otros entregables
-(proyecto, ZIP/RAR, DMD, repositorio, enlace, TXT, PDF). Cada captura o evidencia obligatoria debe quedar
-marcada. Conserva la granularidad de los indicadores de logro de la tabla de evaluación.
+técnicos requeridos (proyecto de código, archivos comprimidos ZIP/RAR, scripts SQL, modelos DMD, repositorios, TXT, PDF).
+Cada captura o evidencia obligatoria debe quedar marcada explícitamente con requires_evidence=True.
+Conserva la granularidad exacta de los indicadores de logro de la tabla oficial de evaluación.
 
-Asignatura indicada por el usuario: {subject_hint or 'no indicada'}
+REGLA CRÍTICA DE EVALUACIÓN:
+Extrae exclusivamente los criterios e indicadores de la pauta sumativa oficial (con puntaje o ponderación).
+Ignora completamente tablas rotuladas como 'Pauta de Autoevaluación', encuestas de metacognición o rúbricas formativas secundarias.
+
+Asignatura o área indicada por el usuario: {subject_hint or 'no indicada'}
 
 PAUTA ENTRE MARCADORES:
 <PAUTA>

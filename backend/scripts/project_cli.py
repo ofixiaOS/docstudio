@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Command-line utility for managing Iplacex projects directly.
+Command-line utility for managing DocStudio projects directly.
 Usage:
     python scripts/project_cli.py list
     python scripts/project_cli.py show <project_id>
@@ -20,7 +20,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 
 from app.settings import settings
 from app.storage import Store
-from docx_exporter import create_iplacex_document
+from docx_exporter import create_docx_document
 from main import parse_html_to_sections, resolve_image_path
 
 
@@ -107,13 +107,13 @@ def cmd_export(args: argparse.Namespace) -> None:
     doc_data = {
         "title": project["title"],
         "subject": project.get("subject", "General"),
-        "student": project.get("student", "Nicolás Javier Jara Guzmán"),
-        "career": project.get("career", "Ingeniería en Informática"),
-        "institution": "Instituto Profesional Iplacex",
+        "student": project.get("student") or settings.default_author or "Autor",
+        "career": project.get("career") or settings.default_career or "",
+        "institution": project.get("institution") or settings.default_institution or "",
         "sections": sections,
     }
-    create_iplacex_document(doc_data, str(output_path))
-    print(f"\n[OK] Documento exportado exitosamente:\n{output_path}\n")
+    create_docx_document(doc_data, str(output_path))
+    print(f"\nDocumento exportado exitosamente a:\n{output_path}\n")
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -126,7 +126,7 @@ def cmd_search(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Iplacex Studio CLI")
+    parser = argparse.ArgumentParser(description="DocStudio CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # list

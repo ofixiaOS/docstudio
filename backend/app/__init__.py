@@ -1,1 +1,1 @@
-"""Application package for Gamma Iplacex."""
+"""Application package for DocStudio."""

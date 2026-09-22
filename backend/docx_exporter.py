@@ -1,10 +1,12 @@
-"""Deterministic Word exporter for Iplacex project documents."""
+"""Deterministic Word exporter for technical and academic documents."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
+from PIL import Image
 from bs4 import BeautifulSoup, NavigableString, Tag
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
@@ -61,15 +63,23 @@ def configure_styles(doc: Document) -> None:
     title.font.size = Pt(24)
     title.font.bold = True
     title.font.color.rgb = BLACK
-    for level, size in ((1, 16), (2, 13), (3, 11.5)):
+    heading_configs = (
+        (1, 16, 14, 5),
+        (2, 13, 10, 5),
+        (3, 11.5, 10, 4),
+        (4, 11, 8, 3),
+        (5, 10.5, 6, 3),
+        (6, 10, 6, 2),
+    )
+    for level, size, before, after in heading_configs:
         style = doc.styles[f"Heading {level}"]
         style.font.name = "Arial"
         style.font.size = Pt(size)
         style.font.bold = True
         style.font.color.rgb = BLACK
         style.paragraph_format.keep_with_next = True
-        style.paragraph_format.space_before = Pt(14 if level == 1 else 10)
-        style.paragraph_format.space_after = Pt(5)
+        style.paragraph_format.space_before = Pt(before)
+        style.paragraph_format.space_after = Pt(after)
 
 
 def add_html_runs(paragraph, content_html: str | None, fallback: str) -> None:
@@ -106,40 +116,62 @@ def add_html_runs(paragraph, content_html: str | None, fallback: str) -> None:
 
 
 def add_cover(doc: Document, data: dict) -> None:
+    institution_text = (data.get("institution") or "").strip()
+    career_text = (data.get("career") or "").strip()
+    student_text = (data.get("student") or "Autor").strip()
+    title_text = (data.get("title") or "Documento Técnico").strip()
+    subject_text = (data.get("subject") or "General").strip()
+    date_text = data.get("date") or datetime.now().strftime("%d-%m-%Y")
+
     spacer = doc.add_paragraph()
-    spacer.paragraph_format.space_before = Pt(42)
-    institution = doc.add_paragraph()
-    run = institution.add_run(data.get("institution", "Instituto Profesional Iplacex").upper())
-    run.font.name = "Arial"
-    run.font.size = Pt(11)
-    run.font.bold = True
-    run.font.color.rgb = MUTED
-    career = doc.add_paragraph(data.get("career", "Ingeniería en Informática").upper())
-    career.runs[0].font.name = "Arial"
-    career.runs[0].font.size = Pt(10)
-    career.runs[0].font.color.rgb = MUTED
-    career.paragraph_format.space_after = Pt(54)
+    spacer.paragraph_format.space_before = Pt(36)
+    
+    if institution_text:
+        institution = doc.add_paragraph()
+        run = institution.add_run(institution_text.upper())
+        run.font.name = "Arial"
+        run.font.size = Pt(11)
+        run.font.bold = True
+        run.font.color.rgb = MUTED
+
+    if career_text:
+        career = doc.add_paragraph(career_text.upper())
+        career.runs[0].font.name = "Arial"
+        career.runs[0].font.size = Pt(10)
+        career.runs[0].font.color.rgb = MUTED
+        career.paragraph_format.space_after = Pt(40)
+    else:
+        spacer2 = doc.add_paragraph()
+        spacer2.paragraph_format.space_after = Pt(28)
 
     title = doc.add_paragraph(style="Title")
-    title.add_run(data.get("title", "Evaluación Académica"))
+    title.add_run(title_text)
     title.paragraph_format.space_after = Pt(14)
-    subject = doc.add_paragraph()
-    subject_run = subject.add_run(f"Asignatura: {data.get('subject', 'General')}")
-    subject_run.font.name = "Arial"
-    subject_run.font.size = Pt(14)
-    subject_run.font.bold = True
-    subject_run.font.color.rgb = BLACK
-    subject.paragraph_format.space_after = Pt(92)
+    
+    if subject_text and subject_text.lower() != "general":
+        subject = doc.add_paragraph()
+        subject_run = subject.add_run(f"Área / Asignatura: {subject_text}")
+        subject_run.font.name = "Arial"
+        subject_run.font.size = Pt(13)
+        subject_run.font.bold = True
+        subject_run.font.color.rgb = BLACK
+        subject.paragraph_format.space_after = Pt(72)
+    else:
+        spacer3 = doc.add_paragraph()
+        spacer3.paragraph_format.space_after = Pt(60)
 
-    table = doc.add_table(rows=3, cols=2)
+    fields = [
+        ("Autor", student_text),
+    ]
+    if subject_text and subject_text.lower() != "general":
+        fields.append(("Tema / Área", subject_text))
+    fields.append(("Fecha", date_text))
+
+    table = doc.add_table(rows=len(fields), cols=2)
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
     table.autofit = False
     set_table_borders(table)
-    fields = (
-        ("Estudiante", data.get("student", "Nicolás Javier Jara Guzmán")),
-        ("Asignatura", data.get("subject", "General")),
-        ("Fecha", data.get("date") or datetime.now().strftime("%d-%m-%Y")),
-    )
+
     for row, (label, value) in zip(table.rows, fields):
         row.cells[0].width = Inches(1.35)
         row.cells[1].width = Inches(5.0)
@@ -176,25 +208,88 @@ def add_code_block(doc: Document, content: str) -> None:
     doc.add_paragraph().paragraph_format.space_after = Pt(3)
 
 
+def add_table_block(doc: Document, rows_data: list[list[str]]) -> None:
+    if not rows_data or not any(rows_data):
+        return
+    cols = max(len(row) for row in rows_data)
+    table = doc.add_table(rows=len(rows_data), cols=cols)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+    set_table_borders(table)
+    for row_idx, row in enumerate(rows_data):
+        is_header = (row_idx == 0)
+        for col_idx in range(cols):
+            val = row[col_idx] if col_idx < len(row) else ""
+            cell = table.cell(row_idx, col_idx)
+            set_cell_margins(cell, top=100, bottom=100, left=140, right=140)
+            if is_header:
+                set_cell_background(cell, "EAF0F7")
+            p = cell.paragraphs[0]
+            p.paragraph_format.space_after = Pt(2)
+            run = p.add_run(val)
+            run.font.name = "Arial"
+            run.font.size = Pt(9.5)
+            if is_header:
+                run.bold = True
+    doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+
 def add_image(doc: Document, path_value: str | None, alt: str | None) -> None:
     if not path_value or not Path(path_value).is_file():
         paragraph = doc.add_paragraph()
         run = paragraph.add_run(f"EVIDENCIA PENDIENTE: {alt or 'Inserte aquí la captura correspondiente.'}")
         run.bold = True
         return
-    paragraph = doc.add_paragraph()
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.add_run().add_picture(path_value, width=Inches(6.2))
+
+    # Pillow inspection and transparent conversion for WebP or non-native Word formats
+    image_source = None
+    try:
+        with Image.open(path_value) as img:
+            img_format = (img.format or "").upper()
+            # python-docx supports PNG, JPEG, GIF, TIFF, BMP natively.
+            # If WebP or other non-native formats, transcode in-memory to PNG.
+            if img_format in {"WEBP", "ICO"} or img_format not in {"PNG", "JPEG", "JPG", "GIF", "TIFF", "BMP"}:
+                buf = BytesIO()
+                if img.mode in ("RGBA", "LA", "P"):
+                    img.save(buf, format="PNG")
+                else:
+                    img.convert("RGB").save(buf, format="PNG")
+                buf.seek(0)
+                image_source = buf
+            else:
+                image_source = path_value
+    except Exception:
+        image_source = None
+
+    if image_source is None:
+        paragraph = doc.add_paragraph()
+        run = paragraph.add_run(f"EVIDENCIA PENDIENTE: {alt or 'Inserte aquí la captura correspondiente.'}")
+        run.bold = True
+        return
+
+    try:
+        paragraph = doc.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.add_run().add_picture(image_source, width=Inches(6.2))
+    except Exception:
+        paragraph.text = ""
+        run = paragraph.add_run(f"EVIDENCIA PENDIENTE: {alt or 'Inserte aquí la captura correspondiente.'}")
+        run.bold = True
+        return
+
     if alt:
         caption = doc.add_paragraph()
         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        caption_run = caption.add_run(alt)
+        caption_text = alt.strip()
+        if not caption_text.lower().startswith("figura"):
+            caption_text = f"Figura: {caption_text}"
+        caption_run = caption.add_run(caption_text)
         caption_run.italic = True
         caption_run.font.name = "Arial"
         caption_run.font.size = Pt(9)
 
 
-def create_iplacex_document(doc_data: dict, output_path: str) -> str:
+def create_docx_document(doc_data: dict, output_path: str) -> str:
     doc = Document()
     configure_styles(doc)
     for section in doc.sections:
@@ -211,12 +306,14 @@ def create_iplacex_document(doc_data: dict, output_path: str) -> str:
         section_type = item.get("type", "paragraph")
         content = item.get("content", "")
         content_html = item.get("content_html")
-        if section_type in {"h1", "h2", "h3"}:
+        if section_type in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             level = int(section_type[-1])
             paragraph = doc.add_paragraph(style=f"Heading {level}")
             paragraph.add_run(content)
         elif section_type == "code":
             add_code_block(doc, content)
+        elif section_type == "table":
+            add_table_block(doc, item.get("table_rows") or [])
         elif section_type == "image":
             add_image(doc, item.get("image_path"), item.get("image_alt"))
         elif section_type == "callout":
@@ -237,3 +334,7 @@ def create_iplacex_document(doc_data: dict, output_path: str) -> str:
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output)
     return str(output)
+
+
+# Export alias
+create_studio_document = create_docx_document
