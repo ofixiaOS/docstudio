@@ -1,0 +1,9 @@
+[mcp_servers.gamma_local]
+command = "backend/.venv/Scripts/python.exe"
+args = ["backend/scripts/gamma_mcp.py"]
+cwd = "."
+enabled = true
+required = false
+startup_timeout_sec = 10
+tool_timeout_sec = 60
+default_tools_approval_mode = "writes"

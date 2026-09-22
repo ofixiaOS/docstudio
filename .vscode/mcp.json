@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "docstudio": {
+      "command": "backend/.venv/Scripts/python.exe",
+      "args": [
+        "backend/scripts/gamma_mcp.py"
+      ],
+      "env": {
+        "GAMMA_API_URL": "http://127.0.0.1:8765"
+      }
+    }
+  }
+}
