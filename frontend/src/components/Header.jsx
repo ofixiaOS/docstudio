@@ -1,16 +1,16 @@
 import React from 'react';
-import { BrainCircuit, FileText, LayoutList, PenLine, Key, Plus } from 'lucide-react';
+import { BrainCircuit, FileText, LayoutList, PenLine, Settings, Plus } from 'lucide-react';
 
 export default function Header({ currentStep, setStep, config, onOpenKeyModal, onReset }) {
   const steps = [
-    { id: 'upload', label: '1. Pauta', icon: FileText },
+    { id: 'upload', label: '1. Inicio / Guía', icon: FileText },
     { id: 'outline', label: '2. Esquema', icon: LayoutList },
     { id: 'editor', label: '3. Editor & Word', icon: PenLine },
   ];
 
   return (
     <header className="navbar">
-      <div className="brand">
+      <div className="brand" onClick={onReset} style={{ cursor: 'pointer' }}>
         <div style={{
           width: 34,
           height: 34,
@@ -24,8 +24,8 @@ export default function Header({ currentStep, setStep, config, onOpenKeyModal, o
         }}>
           <BrainCircuit size={18} />
         </div>
-        <span>Iplacex Studio</span>
-        <span className="brand-badge">Personal</span>
+        <span>DocStudio</span>
+        <span className="brand-badge">Local & MCP</span>
       </div>
 
       <div className="stepper">
@@ -49,10 +49,10 @@ export default function Header({ currentStep, setStep, config, onOpenKeyModal, o
         <button
           className="btn-secondary"
           onClick={onOpenKeyModal}
-          title={`Configuración de IA (${config.model || 'Gemini'})`}
+          title={`Ajustes de Perfil e IA (${config.model || 'Gemini'})`}
         >
-          <Key size={15} color={config.has_api_key ? 'var(--success)' : 'var(--warning)'} />
-          <span>{config.has_api_key ? 'API Conectada' : 'Configurar Clave'}</span>
+          <Settings size={15} color={config.has_api_key ? 'var(--success)' : 'var(--warning)'} />
+          <span>{config.has_api_key ? 'Ajustes' : 'Configurar'}</span>
         </button>
 
         <button
@@ -61,7 +61,7 @@ export default function Header({ currentStep, setStep, config, onOpenKeyModal, o
           title="Nuevo Documento"
         >
           <Plus size={15} />
-          <span>Nuevo trabajo</span>
+          <span>Nuevo</span>
         </button>
       </div>
     </header>

@@ -194,10 +194,52 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .tiptap code { font-family: var(--font-mono); }
 .tiptap blockquote { margin: 14px 0; padding-left: 14px; border-left: 3px solid #6687ba; color: #42526a; font-style: italic; }
 .tiptap img { display: block; max-width: 100%; height: auto; margin: 18px auto 7px; border: 1px solid #d8dde6; }
+.tiptap table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  width: 100%;
+  margin: 18px 0;
+  overflow: hidden;
+}
+.tiptap table td,
+.tiptap table th {
+  min-width: 1em;
+  border: 1px solid #d8dde6;
+  padding: 8px 12px;
+  vertical-align: top;
+  box-sizing: border-box;
+  position: relative;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #20242b;
+}
+.tiptap table th {
+  font-weight: 700;
+  text-align: left;
+  background-color: #f3f4f6;
+  color: #111827;
+}
+.tiptap table .selectedCell:after {
+  z-index: 2;
+  position: absolute;
+  content: "";
+  left: 0; right: 0; top: 0; bottom: 0;
+  background: rgba(92, 141, 255, 0.15);
+  pointer-events: none;
+}
+.tiptap table .column-resize-handle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  bottom: -2px;
+  width: 4px;
+  background-color: #5c8dff;
+  pointer-events: none;
+}
 
 .copilot-panel { position: sticky; top: 80px; height: calc(100vh - 96px); display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-sidebar); overflow: hidden; }
-.copilot-tabs { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--border); }
-.copilot-tabs button { display: flex; align-items: center; justify-content: center; gap: 5px; padding: 11px 5px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-dim); font-size: 11px; font-weight: 700; cursor: pointer; }
+.copilot-tabs { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--border); }
+.copilot-tabs button { display: flex; align-items: center; justify-content: center; gap: 4px; padding: 11px 4px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-dim); font-size: 11px; font-weight: 700; cursor: pointer; white-space: nowrap; }
 .copilot-tabs button.active { color: var(--text-main); border-bottom-color: var(--accent); }
 .panel-content { min-height: 0; flex: 1; padding: 14px; overflow-y: auto; }
 .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 13px; }
@@ -230,6 +272,30 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .source-list strong { color: var(--text-muted); font-size: 10px; }
 .source-list small { color: var(--text-dim); font-size: 9px; }
 .panel-content h4 { color: var(--text-muted); font-size: 11px; }
+
+.suggested-actions { margin-top: 8px; padding-top: 8px; border-top: 1px dashed rgba(255, 255, 255, 0.12); display: flex; flex-direction: column; gap: 5px; }
+.suggested-actions-label { font-size: 9.5px; color: var(--text-dim); text-transform: uppercase; font-weight: 700; letter-spacing: 0.05em; }
+.suggested-actions-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+.btn-action-insert { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid rgba(92, 141, 255, 0.35); border-radius: 6px; background: rgba(92, 141, 255, 0.12); color: #93c5fd; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+.btn-action-insert:hover { background: rgba(92, 141, 255, 0.25); border-color: rgba(92, 141, 255, 0.55); color: #bfdbfe; }
+
+.memory-panel { display: flex; flex-direction: column; gap: 14px; }
+.memory-form { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-card); }
+.memory-form textarea { width: 100%; min-height: 52px; padding: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-input); color: var(--text-main); font-size: 11px; resize: vertical; }
+.memory-form-row { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.memory-form select { padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-input); color: var(--text-main); font-size: 11px; }
+.memory-list { display: flex; flex-direction: column; gap: 7px; }
+.memory-item { display: flex; flex-direction: column; gap: 5px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); }
+.memory-item-header { display: flex; align-items: center; justify-content: space-between; }
+.memory-badge { font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; }
+.memory-badge.decision { background: rgba(59, 130, 246, 0.15); color: #60a5fa; }
+.memory-badge.preference { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
+.memory-badge.fact { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+.memory-badge.style { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
+.memory-item p { font-size: 11px; color: var(--text-muted); line-height: 1.4; margin: 0; }
+.btn-icon-danger { background: transparent; border: none; color: var(--text-dim); cursor: pointer; padding: 3px; border-radius: 4px; display: flex; align-items: center; }
+.btn-icon-danger:hover { color: #f87171; background: rgba(239, 68, 68, 0.1); }
+
 
 .floating-ai-bar { position: fixed; left: calc(50% + 130px); bottom: 18px; z-index: 60; transform: translateX(-50%); width: min(610px, calc(100vw - 660px)); display: flex; align-items: center; gap: 7px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 11px; background: rgba(17,20,27,.96); color: var(--accent); backdrop-filter: blur(14px); }
 .ai-input { flex: 1; min-width: 0; padding: 4px; border: 0; outline: 0; background: transparent; color: var(--text-main); font-size: 12px; }

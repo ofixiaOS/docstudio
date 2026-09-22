@@ -2,24 +2,23 @@ import React, { useState, useRef } from 'react';
 import { UploadCloud, Wand2, BookOpen, User, GraduationCap, CheckCircle2 } from 'lucide-react';
 
 const COMMON_SUBJECTS = [
-  'Paradigma Orientado a Objetos',
   'Sistemas Operativos',
-  'Modelamiento de Bases de Datos',
-  'Programación de Bases de Datos',
-  'Consulta de Datos',
+  'Bases de Datos',
+  'Arquitectura de Software',
   'Programación Web',
-  'Diseño Web',
-  'Modelamiento y Programación No SQL',
-  'Red Hat Linux',
-  'Inglés Técnico',
+  'Redes y Seguridad',
+  'Inteligencia Artificial',
+  'Ingeniería de Software',
+  'Informe Técnico',
 ];
 
-export default function UploadView({ onAnalyze, loading, config }) {
+export default function UploadView({ onAnalyze, onCreateOffline, loading, config }) {
   const [file, setFile] = useState(null);
   const [pautaText, setPautaText] = useState('');
+  const [projectTitle, setProjectTitle] = useState('');
   const [subject, setSubject] = useState('');
-  const [student, setStudent] = useState(config.default_student || 'Nicolás Javier Jara Guzmán');
-  const [career, setCareer] = useState(config.default_career || 'Ingeniería en Informática');
+  const [student, setStudent] = useState(config.default_student || 'Autor');
+  const [career, setCareer] = useState(config.default_career || '');
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef(null);
 
@@ -40,20 +39,41 @@ export default function UploadView({ onAnalyze, loading, config }) {
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!file && !pautaText.trim()) {
-      alert('Por favor sube un archivo (PDF o Word) o pega el texto de la pauta.');
+      if (!projectTitle.trim()) {
+        alert('Escribe al menos un título para crear el documento o sube una pauta.');
+        return;
+      }
+      onCreateOffline({ title: projectTitle, file: null, pautaText: 'Documento en blanco', subject, student, career });
       return;
     }
-    onAnalyze({ file, pautaText, subject, student, career });
+    if (config.has_api_key) {
+      onAnalyze({ file, pautaText, subject, student, career });
+      return;
+    }
+    if (!projectTitle.trim()) {
+      alert('Escribe un título para crear el proyecto.');
+      return;
+    }
+    onCreateOffline({ title: projectTitle, file, pautaText, subject, student, career });
+  };
+
+  const createOffline = () => {
+    if (!projectTitle.trim() && !file && !pautaText.trim()) {
+      alert('Escribe un título para crear el proyecto en blanco.');
+      return;
+    }
+    const title = projectTitle.trim() || 'Nuevo Documento';
+    onCreateOffline({ title, file, pautaText: pautaText || 'Documento inicial', subject, student, career });
   };
 
   return (
     <div className="upload-card">
       <div style={{ maxWidth: 640, margin: '0 auto 1.5rem auto' }}>
         <h1 style={{ fontSize: '2rem', fontWeight: 800, letterSpacing: '-0.02em', marginBottom: '0.6rem' }}>
-          Convierte una pauta en un proyecto verificable
+          Crea o desarrolla tu documento asistido por IA
         </h1>
         <p style={{ color: 'var(--text-muted)', fontSize: '0.95rem' }}>
-          La IA separa criterios, entregables, código y capturas obligatorias. El trabajo queda guardado localmente con historial, fuentes y memoria del proyecto.
+          Sube una guía, pauta o requerimientos (o parte en blanco). El estudio estructura el esquema, aprende tus preferencias con memoria activa y exporta a Word profesional.
         </p>
       </div>
 
@@ -113,6 +133,16 @@ export default function UploadView({ onAnalyze, loading, config }) {
 
         {/* Metadatos del Estudiante y Ramo */}
         <div className="form-grid">
+          <div className="form-group" style={{ gridColumn: 'span 2' }}>
+            <label><BookOpen size={13} style={{ display: 'inline', marginRight: 4 }} /> Título del proyecto {config.has_api_key ? '(obligatorio solo en modo local)' : '(obligatorio)'}</label>
+            <input
+              type="text"
+              className="form-input"
+              value={projectTitle}
+              onChange={(e) => setProjectTitle(e.target.value)}
+              placeholder="Ej: Evaluación 2 - Modelamiento de Base de Datos"
+            />
+          </div>
           <div className="form-group">
             <label><User size={13} style={{ display: 'inline', marginRight: 4 }} /> Nombre del Estudiante</label>
             <input
@@ -120,18 +150,18 @@ export default function UploadView({ onAnalyze, loading, config }) {
               className="form-input"
               value={student}
               onChange={(e) => setStudent(e.target.value)}
-              placeholder="Nicolás Javier Jara Guzmán"
+              placeholder={config?.default_student || 'Ej: Nombre y Apellido'}
             />
           </div>
 
           <div className="form-group">
-            <label><GraduationCap size={13} style={{ display: 'inline', marginRight: 4 }} /> Carrera</label>
+            <label><GraduationCap size={13} style={{ display: 'inline', marginRight: 4 }} /> Carrera / Área</label>
             <input
               type="text"
               className="form-input"
               value={career}
               onChange={(e) => setCareer(e.target.value)}
-              placeholder="Ingeniería en Informática"
+              placeholder={config?.default_career || 'Ej: Ingeniería en Informática'}
             />
           </div>
 
@@ -154,7 +184,7 @@ export default function UploadView({ onAnalyze, loading, config }) {
         </div>
 
         {/* Botón Principal */}
-        <div style={{ marginTop: '2.5rem', display: 'flex', justifyContent: 'center' }}>
+        <div style={{ marginTop: '2.5rem', display: 'flex', justifyContent: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
           <button
             type="submit"
             className="btn-primary"
@@ -164,15 +194,26 @@ export default function UploadView({ onAnalyze, loading, config }) {
             {loading ? (
               <>
                 <div className="spinner" />
-                <span>Analizando Pauta con IA...</span>
+                <span>{config.has_api_key ? 'Analizando pauta con IA...' : 'Creando proyecto local...'}</span>
               </>
-            ) : (
+            ) : config.has_api_key ? (
               <>
                 <Wand2 size={20} />
                 <span>Analizar pauta y crear proyecto</span>
               </>
+            ) : (
+              <>
+                <BookOpen size={20} />
+                <span>Crear proyecto sin IA</span>
+              </>
             )}
           </button>
+          {config.has_api_key && (
+            <button type="button" className="btn-secondary" onClick={createOffline} disabled={loading}
+              style={{ padding: '0.8rem 1.4rem', fontSize: '0.95rem', borderRadius: 12 }}>
+              <BookOpen size={18} /> Crear sin IA
+            </button>
+          )}
         </div>
       </form>
     </div>

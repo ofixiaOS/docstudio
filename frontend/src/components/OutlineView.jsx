@@ -1,10 +1,11 @@
-import React from 'react';
-import { Sparkles, Plus, Trash2, Code2, Image as ImageIcon, ArrowLeft, CheckCircle, PackageCheck } from 'lucide-react';
+import { Sparkles, Plus, Trash2, Code2, Image as ImageIcon, ArrowLeft, CheckCircle, PackageCheck, PenLine } from 'lucide-react';
 
 export default function OutlineView({
   analysisData,
   setAnalysisData,
+  onUpdateOutline,
   onGenerate,
+  onContinueOffline,
   onBack,
   generating
 }) {
@@ -13,7 +14,11 @@ export default function OutlineView({
   const handleUpdateCard = (index, field, value) => {
     const updated = [...outline];
     updated[index] = { ...updated[index], [field]: value };
-    setAnalysisData({ ...analysisData, outline: updated });
+    if (onUpdateOutline) {
+      onUpdateOutline(updated);
+    } else {
+      setAnalysisData({ ...analysisData, outline: updated });
+    }
   };
 
   const handleDeleteCard = (index) => {
@@ -22,14 +27,18 @@ export default function OutlineView({
       return;
     }
     const updated = outline.filter((_, i) => i !== index);
-    setAnalysisData({ ...analysisData, outline: updated });
+    if (onUpdateOutline) {
+      onUpdateOutline(updated);
+    } else {
+      setAnalysisData({ ...analysisData, outline: updated });
+    }
   };
 
   const handleAddCard = () => {
     const newId = `sec-${Date.now()}`;
     const newCard = {
       id: newId,
-      title: `${outline.length}. Nueva Sección de Desarrollo`,
+      title: `${outline.length + 1}. Nueva Sección de Desarrollo`,
       description: 'Detalle de los requerimientos y respuestas para esta sección.',
       type: 'development',
       needs_code: false,
@@ -43,7 +52,11 @@ export default function OutlineView({
     } else {
       updated = [...outline, newCard];
     }
-    setAnalysisData({ ...analysisData, outline: updated });
+    if (onUpdateOutline) {
+      onUpdateOutline(updated);
+    } else {
+      setAnalysisData({ ...analysisData, outline: updated });
+    }
   };
 
   return (
@@ -66,24 +79,39 @@ export default function OutlineView({
           </p>
         </div>
 
-        <button
-          className="btn-primary"
-          onClick={onGenerate}
-          disabled={generating}
-          style={{ padding: '0.75rem 1.6rem', fontSize: '0.95rem' }}
-        >
-          {generating ? (
-            <>
-              <div className="spinner" />
-              <span>Redactando Informe...</span>
-            </>
-          ) : (
-            <>
-              <Sparkles size={18} />
-              <span>Generar Documento</span>
-            </>
+        <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center' }}>
+          {onContinueOffline && (
+            <button
+              type="button"
+              className="btn-secondary"
+              onClick={onContinueOffline}
+              disabled={generating}
+              title="Abrir editor con este esquema sin redactar con IA"
+              style={{ padding: '0.75rem 1.2rem', fontSize: '0.95rem' }}
+            >
+              <PenLine size={16} />
+              <span>Continuar al Editor</span>
+            </button>
           )}
-        </button>
+          <button
+            className="btn-primary"
+            onClick={onGenerate}
+            disabled={generating}
+            style={{ padding: '0.75rem 1.6rem', fontSize: '0.95rem' }}
+          >
+            {generating ? (
+              <>
+                <div className="spinner" />
+                <span>Redactando Informe...</span>
+              </>
+            ) : (
+              <>
+                <Sparkles size={18} />
+                <span>Generar con IA</span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
 
       {deliverables.length > 0 && (
@@ -99,7 +127,7 @@ export default function OutlineView({
       <div className="outline-meta-card">
         <div>
           <div style={{ display: 'inline-block', background: 'rgba(59, 130, 246, 0.15)', color: 'var(--accent)', fontSize: '0.75rem', fontWeight: 700, padding: '0.2rem 0.6rem', borderRadius: 6, marginBottom: '0.4rem' }}>
-            {subject || 'Asignatura Iplacex'}
+            {subject || 'Asignatura / Área'}
           </div>
           <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--text-main)', marginBottom: '0.4rem' }}>
             {title || 'Evaluación Académica'}
@@ -192,12 +220,24 @@ export default function OutlineView({
       </div>
 
       {/* Botón inferior fijo/de acción */}
-      <div style={{ display: 'flex', justifyContent: 'center', margin: '3rem 0 2rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem', flexWrap: 'wrap', margin: '3rem 0 2rem' }}>
+        {onContinueOffline && (
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={onContinueOffline}
+            disabled={generating}
+            style={{ padding: '0.9rem 2rem', fontSize: '1.05rem', borderRadius: 12 }}
+          >
+            <PenLine size={18} />
+            <span>Continuar al Editor (sin IA)</span>
+          </button>
+        )}
         <button
           className="btn-primary"
           onClick={onGenerate}
           disabled={generating}
-          style={{ padding: '0.9rem 3rem', fontSize: '1.05rem', borderRadius: 12 }}
+          style={{ padding: '0.9rem 2.5rem', fontSize: '1.05rem', borderRadius: 12 }}
         >
           {generating ? (
             <>
@@ -207,7 +247,7 @@ export default function OutlineView({
           ) : (
             <>
               <Sparkles size={20} />
-              <span>Generar Documento Completo</span>
+              <span>Generar Documento con IA</span>
             </>
           )}
         </button>
